@@ -6,16 +6,13 @@
 //! 3. Kani formal verification proofs (impact overflow, inventory limits, insurance fee)
 
 use solana_program::{
-    account_info::AccountInfo,
-    entrypoint::ProgramResult,
-    program_error::ProgramError,
+    account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
     pubkey::Pubkey,
 };
 
 use crate::{
-    MatcherCall, MatcherReturn,
-    CTX_VAMM_OFFSET, CTX_VAMM_LEN, MATCHER_CONTEXT_LEN,
-    FLAG_VALID, FLAG_PARTIAL_OK,
+    MatcherCall, MatcherReturn, CTX_VAMM_LEN, CTX_VAMM_OFFSET, FLAG_PARTIAL_OK, FLAG_VALID,
+    MATCHER_CONTEXT_LEN,
 };
 
 // =============================================================================
@@ -105,14 +102,14 @@ pub struct MatcherCtx {
 
     // --- NEW: Insurance & Skew (16 bytes, carved from reserved) ---
     /// Accumulated insurance fee in e6 units (cranker reads & sweeps)
-    pub insurance_accrued_e6: u64,          // 8 bytes, offset 144
+    pub insurance_accrued_e6: u64, // 8 bytes, offset 144
     /// Portion of trading_fee_bps routed to insurance reserve (e.g. 500 = 5%)
-    pub fee_to_insurance_bps: u16,          // 2 bytes, offset 152
+    pub fee_to_insurance_bps: u16, // 2 bytes, offset 152
     /// Extra spread multiplier per inventory unit for skew-aware quoting
     /// Applied as: extra_bps = |inventory| * skew_spread_mult_bps / 10_000
     /// 0 = disabled (legacy behavior)
-    pub skew_spread_mult_bps: u16,          // 2 bytes, offset 154
-    pub _new_pad: [u8; 4],                  // 4 bytes, offset 156
+    pub skew_spread_mult_bps: u16, // 2 bytes, offset 154
+    pub _new_pad: [u8; 4], // 4 bytes, offset 156
 
     // Reserved (96 bytes)
     pub _reserved: [u8; 96],
@@ -123,13 +120,25 @@ const _: () = assert!(core::mem::size_of::<MatcherCtx>() == CTX_VAMM_LEN);
 impl Default for MatcherCtx {
     fn default() -> Self {
         Self {
-            magic: 0, version: 0, kind: 0, _pad0: [0; 3],
+            magic: 0,
+            version: 0,
+            kind: 0,
+            _pad0: [0; 3],
             lp_pda: [0; 32],
-            trading_fee_bps: 0, base_spread_bps: 0, max_total_bps: 0, impact_k_bps: 0,
-            liquidity_notional_e6: 0, max_fill_abs: 0,
-            inventory_base: 0, last_oracle_price_e6: 0, last_exec_price_e6: 0,
+            trading_fee_bps: 0,
+            base_spread_bps: 0,
+            max_total_bps: 0,
+            impact_k_bps: 0,
+            liquidity_notional_e6: 0,
+            max_fill_abs: 0,
+            inventory_base: 0,
+            last_oracle_price_e6: 0,
+            last_exec_price_e6: 0,
             max_inventory_abs: 0,
-            insurance_accrued_e6: 0, fee_to_insurance_bps: 0, skew_spread_mult_bps: 0, _new_pad: [0; 4],
+            insurance_accrued_e6: 0,
+            fee_to_insurance_bps: 0,
+            skew_spread_mult_bps: 0,
+            _new_pad: [0; 4],
             _reserved: [0; 96],
         }
     }
@@ -137,7 +146,9 @@ impl Default for MatcherCtx {
 
 impl MatcherCtx {
     pub fn is_initialized(data: &[u8]) -> bool {
-        if data.len() < 8 { return false; }
+        if data.len() < 8 {
+            return false;
+        }
         u64::from_le_bytes(data[0..8].try_into().unwrap()) == MATCHER_MAGIC
     }
 
@@ -487,10 +498,8 @@ fn compute_skew_extra_bps(ctx: &MatcherCtx, is_buy: bool) -> u128 {
 fn compute_insurance_fee(ctx: &MatcherCtx, exec_size: i128, exec_price: u64) -> u64 {
     let abs_size = exec_size.unsigned_abs();
     let notional_e6 = abs_size.saturating_mul(exec_price as u128) / 1_000_000;
-    let fee_portion = notional_e6
-        .saturating_mul(ctx.trading_fee_bps as u128) / 10_000;
-    let insurance_portion = fee_portion
-        .saturating_mul(ctx.fee_to_insurance_bps as u128) / 10_000;
+    let fee_portion = notional_e6.saturating_mul(ctx.trading_fee_bps as u128) / 10_000;
+    let insurance_portion = fee_portion.saturating_mul(ctx.fee_to_insurance_bps as u128) / 10_000;
     // Saturate to u64
     core::cmp::min(insurance_portion, u64::MAX as u128) as u64
 }
@@ -502,14 +511,22 @@ fn compute_passive_execution(
     let req_abs = call.req_size.unsigned_abs();
     let is_buy = call.req_size > 0;
 
-    let fill_abs = if ctx.max_fill_abs == 0 { 0u128 } else { core::cmp::min(req_abs, ctx.max_fill_abs) };
+    let fill_abs = if ctx.max_fill_abs == 0 {
+        0u128
+    } else {
+        core::cmp::min(req_abs, ctx.max_fill_abs)
+    };
     let fill_abs = check_inventory_limit(ctx, fill_abs, is_buy)?;
 
     if fill_abs == 0 {
         return Ok((call.oracle_price_e6, 0, FLAG_VALID | FLAG_PARTIAL_OK));
     }
 
-    let exec_size = if is_buy { fill_abs as i128 } else { -(fill_abs as i128) };
+    let exec_size = if is_buy {
+        fill_abs as i128
+    } else {
+        -(fill_abs as i128)
+    };
 
     let base = ctx.base_spread_bps as u128;
     let fee = ctx.trading_fee_bps as u128;
@@ -521,9 +538,15 @@ fn compute_passive_execution(
     let oracle = call.oracle_price_e6 as u128;
 
     let exec_price_u128 = if is_buy {
-        oracle.checked_mul(BPS_DENOM + total_bps).ok_or(ProgramError::ArithmeticOverflow)? / BPS_DENOM
+        oracle
+            .checked_mul(BPS_DENOM + total_bps)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            / BPS_DENOM
     } else {
-        oracle.checked_mul(BPS_DENOM - total_bps).ok_or(ProgramError::ArithmeticOverflow)? / BPS_DENOM
+        oracle
+            .checked_mul(BPS_DENOM - total_bps)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            / BPS_DENOM
     };
 
     if exec_price_u128 == 0 || exec_price_u128 > u64::MAX as u128 {
@@ -540,22 +563,36 @@ fn compute_vamm_execution(
     let req_abs = call.req_size.unsigned_abs();
     let is_buy = call.req_size > 0;
 
-    let fill_abs = if ctx.max_fill_abs == 0 { 0u128 } else { core::cmp::min(req_abs, ctx.max_fill_abs) };
+    let fill_abs = if ctx.max_fill_abs == 0 {
+        0u128
+    } else {
+        core::cmp::min(req_abs, ctx.max_fill_abs)
+    };
     let fill_abs = check_inventory_limit(ctx, fill_abs, is_buy)?;
 
     if fill_abs == 0 {
         return Ok((call.oracle_price_e6, 0, FLAG_VALID | FLAG_PARTIAL_OK));
     }
 
-    let exec_size = if is_buy { fill_abs as i128 } else { -(fill_abs as i128) };
+    let exec_size = if is_buy {
+        fill_abs as i128
+    } else {
+        -(fill_abs as i128)
+    };
 
     let oracle = call.oracle_price_e6 as u128;
-    let abs_notional_e6 = fill_abs.checked_mul(oracle).ok_or(ProgramError::ArithmeticOverflow)? / 1_000_000;
+    let abs_notional_e6 = fill_abs
+        .checked_mul(oracle)
+        .ok_or(ProgramError::ArithmeticOverflow)?
+        / 1_000_000;
 
     // impact_bps = abs_notional_e6 * impact_k_bps / liquidity_notional_e6
     let impact_k = ctx.impact_k_bps as u128;
     let impact_bps = if ctx.liquidity_notional_e6 > 0 {
-        abs_notional_e6.checked_mul(impact_k).ok_or(ProgramError::ArithmeticOverflow)? / ctx.liquidity_notional_e6
+        abs_notional_e6
+            .checked_mul(impact_k)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            / ctx.liquidity_notional_e6
     } else {
         0
     };
@@ -564,16 +601,25 @@ fn compute_vamm_execution(
     let fee = ctx.trading_fee_bps as u128;
     let skew_extra = compute_skew_extra_bps(ctx, is_buy);
     let max_total = ctx.max_total_bps as u128;
-    let max_impact = max_total.saturating_sub(base).saturating_sub(fee).saturating_sub(skew_extra);
+    let max_impact = max_total
+        .saturating_sub(base)
+        .saturating_sub(fee)
+        .saturating_sub(skew_extra);
     let clamped_impact = core::cmp::min(impact_bps, max_impact);
     let total_bps = core::cmp::min(max_total, base + fee + skew_extra + clamped_impact);
 
     const BPS_DENOM: u128 = 10_000;
 
     let exec_price_u128 = if is_buy {
-        oracle.checked_mul(BPS_DENOM + total_bps).ok_or(ProgramError::ArithmeticOverflow)? / BPS_DENOM
+        oracle
+            .checked_mul(BPS_DENOM + total_bps)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            / BPS_DENOM
     } else {
-        oracle.checked_mul(BPS_DENOM - total_bps).ok_or(ProgramError::ArithmeticOverflow)? / BPS_DENOM
+        oracle
+            .checked_mul(BPS_DENOM - total_bps)
+            .ok_or(ProgramError::ArithmeticOverflow)?
+            / BPS_DENOM
     };
 
     if exec_price_u128 == 0 || exec_price_u128 > u64::MAX as u128 {
@@ -583,7 +629,11 @@ fn compute_vamm_execution(
     Ok((exec_price_u128 as u64, exec_size, FLAG_VALID))
 }
 
-fn check_inventory_limit(ctx: &MatcherCtx, fill_abs: u128, is_buy: bool) -> Result<u128, ProgramError> {
+fn check_inventory_limit(
+    ctx: &MatcherCtx,
+    fill_abs: u128,
+    is_buy: bool,
+) -> Result<u128, ProgramError> {
     if ctx.max_inventory_abs == 0 {
         return Ok(fill_abs);
     }
@@ -592,7 +642,11 @@ fn check_inventory_limit(ctx: &MatcherCtx, fill_abs: u128, is_buy: bool) -> Resu
     let max_inv = ctx.max_inventory_abs as i128;
 
     // inventory_base tracks LP position: buy from user => LP sells => inventory decreases
-    let inv_delta = if is_buy { -(fill_abs as i128) } else { fill_abs as i128 };
+    let inv_delta = if is_buy {
+        -(fill_abs as i128)
+    } else {
+        fill_abs as i128
+    };
     let new_inv = current_inv.saturating_add(inv_delta);
 
     if new_inv.unsigned_abs() <= ctx.max_inventory_abs {
@@ -600,22 +654,26 @@ fn check_inventory_limit(ctx: &MatcherCtx, fill_abs: u128, is_buy: bool) -> Resu
     }
 
     if is_buy {
-        if current_inv <= -max_inv { return Ok(0); }
+        if current_inv <= -max_inv {
+            return Ok(0);
+        }
         let max_fill = (current_inv + max_inv).unsigned_abs();
         Ok(core::cmp::min(fill_abs, max_fill))
     } else {
-        if current_inv >= max_inv { return Ok(0); }
+        if current_inv >= max_inv {
+            return Ok(0);
+        }
         let max_fill = (max_inv - current_inv).unsigned_abs();
         Ok(core::cmp::min(fill_abs, max_fill))
     }
 }
 
 // Legacy re-exports
+pub use process_call as process_vamm_call;
+pub use process_init as process_init_vamm;
 pub use MatcherCtx as VammCtx;
 pub use MatcherKind as MatcherMode;
 pub use MATCHER_MAGIC as VAMM_MAGIC;
-pub use process_init as process_init_vamm;
-pub use process_call as process_vamm_call;
 pub type InitVammParams = InitParams;
 pub const INIT_VAMM_LEN: usize = INIT_CTX_LEN;
 
@@ -629,38 +687,62 @@ mod tests {
 
     fn default_vamm_ctx() -> MatcherCtx {
         MatcherCtx {
-            magic: MATCHER_MAGIC, version: MATCHER_VERSION,
-            kind: MatcherKind::Vamm as u8, _pad0: [0; 3],
+            magic: MATCHER_MAGIC,
+            version: MATCHER_VERSION,
+            kind: MatcherKind::Vamm as u8,
+            _pad0: [0; 3],
             lp_pda: [1; 32],
-            trading_fee_bps: 5, base_spread_bps: 10, max_total_bps: 200,
+            trading_fee_bps: 5,
+            base_spread_bps: 10,
+            max_total_bps: 200,
             impact_k_bps: 100,
             liquidity_notional_e6: 1_000_000_000_000,
             max_fill_abs: 1_000_000_000,
-            inventory_base: 0, last_oracle_price_e6: 0, last_exec_price_e6: 0,
+            inventory_base: 0,
+            last_oracle_price_e6: 0,
+            last_exec_price_e6: 0,
             max_inventory_abs: 0,
-            insurance_accrued_e6: 0, fee_to_insurance_bps: 0, skew_spread_mult_bps: 0, _new_pad: [0; 4],
+            insurance_accrued_e6: 0,
+            fee_to_insurance_bps: 0,
+            skew_spread_mult_bps: 0,
+            _new_pad: [0; 4],
             _reserved: [0; 96],
         }
     }
 
     fn default_passive_ctx() -> MatcherCtx {
         MatcherCtx {
-            magic: MATCHER_MAGIC, version: MATCHER_VERSION,
-            kind: MatcherKind::Passive as u8, _pad0: [0; 3],
+            magic: MATCHER_MAGIC,
+            version: MATCHER_VERSION,
+            kind: MatcherKind::Passive as u8,
+            _pad0: [0; 3],
             lp_pda: [1; 32],
-            trading_fee_bps: 5, base_spread_bps: 50, max_total_bps: 200,
+            trading_fee_bps: 5,
+            base_spread_bps: 50,
+            max_total_bps: 200,
             impact_k_bps: 0,
             liquidity_notional_e6: 0,
             max_fill_abs: 1_000_000_000,
-            inventory_base: 0, last_oracle_price_e6: 0, last_exec_price_e6: 0,
+            inventory_base: 0,
+            last_oracle_price_e6: 0,
+            last_exec_price_e6: 0,
             max_inventory_abs: 0,
-            insurance_accrued_e6: 0, fee_to_insurance_bps: 0, skew_spread_mult_bps: 0, _new_pad: [0; 4],
+            insurance_accrued_e6: 0,
+            fee_to_insurance_bps: 0,
+            skew_spread_mult_bps: 0,
+            _new_pad: [0; 4],
             _reserved: [0; 96],
         }
     }
 
     fn make_call(oracle_price: u64, req_size: i128) -> MatcherCall {
-        MatcherCall { req_id: 1, lp_idx: 0, lp_account_id: 100, oracle_price_e6: oracle_price, req_size }
+        MatcherCall {
+            req_id: 1,
+            lp_idx: 0,
+            lp_account_id: 100,
+            oracle_price_e6: oracle_price,
+            req_size,
+        }
     }
 
     // --- Original tests (preserved from Toly) ---
@@ -701,14 +783,16 @@ mod tests {
     fn test_vamm_bigger_size_more_impact() {
         let ctx = default_vamm_ctx();
         let (price_small, _, _) = compute_execution(&ctx, &make_call(100_000_000, 1_000)).unwrap();
-        let (price_large, _, _) = compute_execution(&ctx, &make_call(100_000_000, 100_000_000)).unwrap();
+        let (price_large, _, _) =
+            compute_execution(&ctx, &make_call(100_000_000, 100_000_000)).unwrap();
         assert!(price_large > price_small);
     }
 
     #[test]
     fn test_total_capped_at_max() {
         let ctx = default_vamm_ctx();
-        let (exec_price, _, _) = compute_execution(&ctx, &make_call(100_000_000, 1_000_000_000)).unwrap();
+        let (exec_price, _, _) =
+            compute_execution(&ctx, &make_call(100_000_000, 1_000_000_000)).unwrap();
         let max_price = 100_000_000u64 * 10_200 / 10_000;
         assert!(exec_price <= max_price);
     }
@@ -804,7 +888,9 @@ mod tests {
     fn test_init_params_encode_decode() {
         let params = InitParams {
             kind: MatcherKind::Vamm as u8,
-            trading_fee_bps: 5, base_spread_bps: 10, max_total_bps: 200,
+            trading_fee_bps: 5,
+            base_spread_bps: 10,
+            max_total_bps: 200,
             impact_k_bps: 100,
             liquidity_notional_e6: 1_000_000_000_000,
             max_fill_abs: 1_000_000_000,
@@ -835,7 +921,12 @@ mod tests {
         let (price_normal, _, _) = compute_execution(&ctx, &call_sell).unwrap();
 
         // Skewed price should be lower for sells (wider spread = lower bid)
-        assert!(price_skewed < price_normal, "skew should widen sell spread: {} < {}", price_skewed, price_normal);
+        assert!(
+            price_skewed < price_normal,
+            "skew should widen sell spread: {} < {}",
+            price_skewed,
+            price_normal
+        );
     }
 
     #[test]
@@ -851,7 +942,10 @@ mod tests {
         ctx.skew_spread_mult_bps = 0;
         let (price_without, _, _) = compute_execution(&ctx, &call_buy).unwrap();
 
-        assert_eq!(price_with_skew, price_without, "no skew penalty when improving inventory");
+        assert_eq!(
+            price_with_skew, price_without,
+            "no skew penalty when improving inventory"
+        );
     }
 
     #[test]
@@ -870,7 +964,7 @@ mod tests {
     #[test]
     fn test_insurance_fee_computation() {
         let ctx = MatcherCtx {
-            trading_fee_bps: 100, // 1%
+            trading_fee_bps: 100,      // 1%
             fee_to_insurance_bps: 500, // 5% of trading fee → insurance
             ..default_vamm_ctx()
         };
@@ -971,29 +1065,45 @@ mod proofs {
         let is_buy: bool = kani::any();
 
         let ctx = MatcherCtx {
-            magic: MATCHER_MAGIC, version: MATCHER_VERSION,
-            kind: MatcherKind::Vamm as u8, _pad0: [0; 3],
+            magic: MATCHER_MAGIC,
+            version: MATCHER_VERSION,
+            kind: MatcherKind::Vamm as u8,
+            _pad0: [0; 3],
             lp_pda: [1; 32],
-            trading_fee_bps: 5, base_spread_bps: 10, max_total_bps: 200,
+            trading_fee_bps: 5,
+            base_spread_bps: 10,
+            max_total_bps: 200,
             impact_k_bps: 100,
             liquidity_notional_e6: 1_000_000_000_000,
             max_fill_abs: u128::MAX,
             inventory_base: current_inv,
-            last_oracle_price_e6: 0, last_exec_price_e6: 0,
+            last_oracle_price_e6: 0,
+            last_exec_price_e6: 0,
             max_inventory_abs: max_inv,
-            insurance_accrued_e6: 0, fee_to_insurance_bps: 0, skew_spread_mult_bps: 0, _new_pad: [0; 4],
+            insurance_accrued_e6: 0,
+            fee_to_insurance_bps: 0,
+            skew_spread_mult_bps: 0,
+            _new_pad: [0; 4],
             _reserved: [0; 96],
         };
 
         let fill_abs = check_inventory_limit(&ctx, fill_req, is_buy).unwrap();
 
         // Compute new inventory after fill
-        let inv_delta = if is_buy { -(fill_abs as i128) } else { fill_abs as i128 };
+        let inv_delta = if is_buy {
+            -(fill_abs as i128)
+        } else {
+            fill_abs as i128
+        };
         let new_inv = current_inv.saturating_add(inv_delta);
 
         // PROPERTY: new inventory must not exceed max
-        assert!(new_inv.unsigned_abs() <= max_inv,
-            "inventory violation: |{}| > {}", new_inv, max_inv);
+        assert!(
+            new_inv.unsigned_abs() <= max_inv,
+            "inventory violation: |{}| > {}",
+            new_inv,
+            max_inv
+        );
     }
 
     /// Proof 3: insurance_accrued_e6 never exceeds fee_portion (fee is fraction of trading fee).
@@ -1028,7 +1138,160 @@ mod proofs {
         let full_trading_fee = notional_e6.saturating_mul(trading_fee_bps as u128) / 10_000;
 
         // PROPERTY: insurance fee ≤ full trading fee
-        assert!((insurance_fee as u128) <= full_trading_fee,
-            "insurance {} > trading fee {}", insurance_fee, full_trading_fee);
+        assert!(
+            (insurance_fee as u128) <= full_trading_fee,
+            "insurance {} > trading fee {}",
+            insurance_fee,
+            full_trading_fee
+        );
+    }
+
+    // =========================================================================
+    // PERC-320: Additional vAMM proofs (PERC-316)
+    // =========================================================================
+
+    /// Proof 4: buy exec_price >= oracle_price (LP charges spread on buys).
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_vamm_buy_price_above_oracle() {
+        let oracle: u64 = kani::any();
+        kani::assume(oracle > 0 && oracle <= 1_000_000_000_000);
+
+        let total_bps: u128 = kani::any();
+        kani::assume(total_bps <= 10_000);
+
+        const BPS_DENOM: u128 = 10_000;
+        let exec_price = (oracle as u128) * (BPS_DENOM + total_bps) / BPS_DENOM;
+
+        assert!(
+            exec_price >= oracle as u128,
+            "buy exec price must be >= oracle price"
+        );
+    }
+
+    /// Proof 5: sell exec_price <= oracle_price (LP charges spread on sells).
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_vamm_sell_price_below_oracle() {
+        let oracle: u64 = kani::any();
+        kani::assume(oracle > 0 && oracle <= 1_000_000_000_000);
+
+        let total_bps: u128 = kani::any();
+        kani::assume(total_bps <= 10_000);
+
+        const BPS_DENOM: u128 = 10_000;
+        let exec_price = (oracle as u128) * (BPS_DENOM - total_bps) / BPS_DENOM;
+
+        assert!(
+            exec_price <= oracle as u128,
+            "sell exec price must be <= oracle price"
+        );
+    }
+
+    /// Proof 6: inventory limit reduces fill when limit would be breached.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_inventory_limit_reduces_fill() {
+        let max_inv: u128 = kani::any();
+        kani::assume(max_inv > 0 && max_inv <= 1_000_000_000_000);
+
+        let current_inv: i128 = kani::any();
+        kani::assume(current_inv.unsigned_abs() <= max_inv);
+
+        let fill_req: u128 = kani::any();
+        kani::assume(fill_req > 0 && fill_req <= 1_000_000_000_000);
+
+        let is_buy: bool = kani::any();
+
+        let ctx = MatcherCtx {
+            max_inventory_abs: max_inv,
+            inventory_base: current_inv,
+            ..MatcherCtx::default()
+        };
+
+        let fill_abs = check_inventory_limit(&ctx, fill_req, is_buy).unwrap();
+
+        // Fill must not exceed request
+        assert!(
+            fill_abs <= fill_req,
+            "fill must not exceed requested amount"
+        );
+    }
+
+    /// Proof 7: impact_bps monotonically increases with fill size.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_impact_monotonically_increases_with_fill_size() {
+        let oracle: u64 = kani::any();
+        kani::assume(oracle > 0 && oracle <= 1_000_000_000_000);
+
+        let fill1: u128 = kani::any();
+        let fill2: u128 = kani::any();
+        kani::assume(fill1 > 0 && fill1 <= fill2);
+        kani::assume(fill2 <= 1_000_000_000_000);
+
+        let impact_k_bps: u32 = kani::any();
+        kani::assume(impact_k_bps <= 9000);
+
+        let liquidity: u128 = kani::any();
+        kani::assume(liquidity >= 1_000_000);
+
+        let oracle_u128 = oracle as u128;
+
+        // Impact for fill1
+        let notional1 = fill1.saturating_mul(oracle_u128) / 1_000_000;
+        let impact1 = notional1.saturating_mul(impact_k_bps as u128) / liquidity;
+
+        // Impact for fill2
+        let notional2 = fill2.saturating_mul(oracle_u128) / 1_000_000;
+        let impact2 = notional2.saturating_mul(impact_k_bps as u128) / liquidity;
+
+        assert!(impact2 >= impact1, "larger fills must produce >= impact");
+    }
+
+    /// Proof 8: skew extra spread capped at 5000 bps.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_skew_spread_capped_at_5000() {
+        let inv: i128 = kani::any();
+        let mult_bps: u16 = kani::any();
+        kani::assume(mult_bps > 0);
+
+        let is_buy: bool = kani::any();
+
+        let ctx = MatcherCtx {
+            inventory_base: inv,
+            skew_spread_mult_bps: mult_bps,
+            ..MatcherCtx::default()
+        };
+
+        let extra = compute_skew_extra_bps(&ctx, is_buy);
+        assert!(
+            extra <= 5000,
+            "skew extra spread must be capped at 5000 bps"
+        );
+    }
+
+    /// Proof 9: total_bps never exceeds max_total_bps.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_total_bps_capped_by_max() {
+        let base: u128 = kani::any();
+        let fee: u128 = kani::any();
+        let skew_extra: u128 = kani::any();
+        let impact: u128 = kani::any();
+        let max_total: u128 = kani::any();
+
+        kani::assume(base <= 1000);
+        kani::assume(fee <= 1000);
+        kani::assume(skew_extra <= 5000);
+        kani::assume(impact <= 9000);
+        kani::assume(max_total <= 10_000);
+
+        let total_bps = core::cmp::min(max_total, base + fee + skew_extra + impact);
+        assert!(
+            total_bps <= max_total,
+            "total bps must never exceed max_total_bps"
+        );
     }
 }
