@@ -1272,7 +1272,46 @@ mod proofs {
         );
     }
 
-    /// Proof 9: total_bps never exceeds max_total_bps.
+    /// Proof 9: passive spread never produces zero exec_price for valid oracle.
+    /// For any valid oracle_price > 0 and total_bps <= 9000 (max_total_bps cap),
+    /// the resulting exec_price is always > 0.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_passive_spread_never_negative() {
+        let oracle: u64 = kani::any();
+        kani::assume(oracle > 0 && oracle <= 1_000_000_000_000); // max $1M
+
+        let base_spread_bps: u32 = kani::any();
+        let trading_fee_bps: u32 = kani::any();
+        let skew_extra: u128 = kani::any();
+
+        kani::assume(base_spread_bps <= 1000);
+        kani::assume(trading_fee_bps <= 1000);
+        kani::assume(skew_extra <= 5000);
+
+        let max_total_bps: u32 = kani::any();
+        kani::assume(max_total_bps <= 9000);
+        kani::assume(base_spread_bps + trading_fee_bps <= max_total_bps);
+
+        let total_bps = core::cmp::min(
+            max_total_bps as u128,
+            base_spread_bps as u128 + trading_fee_bps as u128 + skew_extra,
+        );
+
+        const BPS_DENOM: u128 = 10_000;
+        let oracle_u128 = oracle as u128;
+
+        // Buy side: oracle * (10_000 + total_bps) / 10_000
+        let buy_price = oracle_u128 * (BPS_DENOM + total_bps) / BPS_DENOM;
+        assert!(buy_price > 0, "buy exec_price must always be > 0");
+
+        // Sell side: oracle * (10_000 - total_bps) / 10_000
+        // total_bps <= 9000 < 10_000, so (BPS_DENOM - total_bps) >= 1000 > 0
+        let sell_price = oracle_u128 * (BPS_DENOM - total_bps) / BPS_DENOM;
+        assert!(sell_price > 0, "sell exec_price must always be > 0 for valid oracle");
+    }
+
+    /// Proof 10: total_bps never exceeds max_total_bps.
     #[kani::proof]
     #[kani::unwind(1)]
     fn proof_total_bps_capped_by_max() {

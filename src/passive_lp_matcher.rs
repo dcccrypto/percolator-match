@@ -381,7 +381,9 @@ mod tests {
             max_abs_inventory: 10,
             ..default_cfg()
         };
-        let mut lp = PassiveLpState { inventory_base: -10 };
+        let mut lp = PassiveLpState {
+            inventory_base: -10,
+        };
         let matcher = PassiveOracleBpsMatcher;
 
         let result = matcher.execute_match(&cfg, &mut lp, 100_000, 1, None);
@@ -436,7 +438,10 @@ mod tests {
 
         let result = matcher.execute_match(&cfg, &mut lp, 100_000, -10, None);
         assert_eq!(result.reason, Reason::Ok);
-        assert!(result.exec.size < 0, "exec.size should be negative for sell");
+        assert!(
+            result.exec.size < 0,
+            "exec.size should be negative for sell"
+        );
         assert!(
             result.quote_delta_lp < 0,
             "quote_delta_lp should be negative (LP pays quote)"
