@@ -226,9 +226,9 @@ fn process_matcher_call(
 
 #[cfg(not(feature = "no-entrypoint"))]
 mod entrypoint {
+    use crate::process_instruction as processor;
     #[allow(unused_imports)]
     use alloc::format;
-    use crate::process_instruction as processor;
     use solana_program::{
         account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, pubkey::Pubkey,
     };
