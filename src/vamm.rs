@@ -1308,7 +1308,10 @@ mod proofs {
         // Sell side: oracle * (10_000 - total_bps) / 10_000
         // total_bps <= 9000 < 10_000, so (BPS_DENOM - total_bps) >= 1000 > 0
         let sell_price = oracle_u128 * (BPS_DENOM - total_bps) / BPS_DENOM;
-        assert!(sell_price > 0, "sell exec_price must always be > 0 for valid oracle");
+        assert!(
+            sell_price > 0,
+            "sell exec_price must always be > 0 for valid oracle"
+        );
     }
 
     /// Proof 10: total_bps never exceeds max_total_bps.
