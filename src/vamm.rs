@@ -314,6 +314,12 @@ pub fn process_init(
     let lp_pda = next_account_info(account_iter)?;
     let ctx_account = next_account_info(account_iter)?;
 
+    // PERC-321: LP PDA must sign process_init to prevent unauthorized matcher
+    // initialisation with attacker-controlled parameters (fees, spread, limits).
+    if !lp_pda.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
     if ctx_account.owner != program_id {
         return Err(ProgramError::IncorrectProgramId);
     }
@@ -397,7 +403,12 @@ pub fn process_call(
         // Accrue insurance fee
         if ctx.fee_to_insurance_bps > 0 {
             let insurance_fee = compute_insurance_fee(&ctx, exec_size, exec_price);
-            ctx.insurance_accrued_e6 = ctx.insurance_accrued_e6.saturating_add(insurance_fee);
+            // PERC-321: Use checked_add to detect overflow instead of silently
+            // saturating (which would lose insurance fees at u64::MAX).
+            ctx.insurance_accrued_e6 = ctx
+                .insurance_accrued_e6
+                .checked_add(insurance_fee)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
         }
     }
 
