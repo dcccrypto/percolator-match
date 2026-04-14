@@ -98,7 +98,7 @@ const fn ceil_div_u128(n: u128, d: u128) -> u128 {
     if d == 0 {
         return 0; // Caller must check oracle != 0 before calling
     }
-    (n + d - 1) / d
+    n.div_ceil(d)
 }
 
 /// Compute bid/ask quotes from oracle price
