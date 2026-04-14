@@ -68,7 +68,8 @@ pub const MATCHER_VERSION: u32 = 4; // Bumped from 3 for new fields
 /// 144     2     fee_to_insurance_bps (portion of trading_fee routed to insurance)
 /// 146     2     skew_spread_mult_bps (extra spread multiplier per inventory unit, 0=disabled)
 /// 148     8     insurance_accrued_e6 (accumulated insurance fee, read-only for cranker)
-/// 156     100   _reserved
+/// 156     8     lp_account_id (numeric LP identifier, must match instruction data)
+/// 164     92    _reserved
 /// ```
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -110,9 +111,12 @@ pub struct MatcherCtx {
     /// 0 = disabled (legacy behavior)
     pub skew_spread_mult_bps: u16, // 2 bytes, offset 154
     pub _new_pad: [u8; 4], // 4 bytes, offset 156
+    /// Numeric LP account identifier — must match lp_account_id in every matcher call.
+    /// Set at init from InitParams; validated in process_call to prevent cross-market spoofing.
+    pub lp_account_id: u64, // 8 bytes, offset 160
 
-    // Reserved (96 bytes)
-    pub _reserved: [u8; 96],
+    // Reserved (88 bytes)
+    pub _reserved: [u8; 88],
 }
 
 const _: () = assert!(core::mem::size_of::<MatcherCtx>() == CTX_VAMM_LEN);
@@ -139,7 +143,8 @@ impl Default for MatcherCtx {
             fee_to_insurance_bps: 0,
             skew_spread_mult_bps: 0,
             _new_pad: [0; 4],
-            _reserved: [0; 96],
+            lp_account_id: 0,
+            _reserved: [0; 88],
         }
     }
 }
@@ -163,8 +168,8 @@ impl MatcherCtx {
 
         let mut lp_pda = [0u8; 32];
         lp_pda.copy_from_slice(&data[16..48]);
-        let mut reserved = [0u8; 96];
-        reserved.copy_from_slice(&data[160..256]);
+        let mut reserved = [0u8; 88];
+        reserved.copy_from_slice(&data[168..256]);
 
         Ok(Self {
             magic,
@@ -186,6 +191,7 @@ impl MatcherCtx {
             fee_to_insurance_bps: u16::from_le_bytes(data[152..154].try_into().unwrap()),
             skew_spread_mult_bps: u16::from_le_bytes(data[154..156].try_into().unwrap()),
             _new_pad: [0; 4],
+            lp_account_id: u64::from_le_bytes(data[160..168].try_into().unwrap()),
             _reserved: reserved,
         })
     }
@@ -213,7 +219,8 @@ impl MatcherCtx {
         data[152..154].copy_from_slice(&self.fee_to_insurance_bps.to_le_bytes());
         data[154..156].copy_from_slice(&self.skew_spread_mult_bps.to_le_bytes());
         data[156..160].copy_from_slice(&self._new_pad);
-        data[160..256].copy_from_slice(&self._reserved);
+        data[160..168].copy_from_slice(&self.lp_account_id.to_le_bytes());
+        data[168..256].copy_from_slice(&self._reserved);
         Ok(())
     }
 
@@ -226,6 +233,10 @@ impl MatcherCtx {
     }
 
     pub fn validate(&self) -> Result<(), ProgramError> {
+        // 3E.1: Reject stale or mis-versioned accounts before processing.
+        if self.version != MATCHER_VERSION {
+            return Err(ProgramError::InvalidAccountData);
+        }
         let kind = self.get_kind()?;
         if kind == MatcherKind::Vamm && self.liquidity_notional_e6 == 0 {
             return Err(ProgramError::InvalidAccountData);
@@ -247,6 +258,16 @@ impl MatcherCtx {
         if self.fee_to_insurance_bps > 10_000 {
             return Err(ProgramError::InvalidAccountData);
         }
+        // 3E.4: max_inventory_abs == 0 disables the inventory limit entirely; reject as
+        // invalid config — callers must set an explicit bound.
+        if self.max_inventory_abs == 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // 3E.5: Cap skew_spread_mult_bps at 10_000 bps (100%) at validation time so the
+        // runtime clamp never silently absorbs values that shouldn't be accepted at init.
+        if self.skew_spread_mult_bps > 10_000 {
+            return Err(ProgramError::InvalidAccountData);
+        }
         Ok(())
     }
 }
@@ -255,7 +276,7 @@ impl MatcherCtx {
 // Init Instruction (Tag 2) — extended with new fields
 // =============================================================================
 
-pub const INIT_CTX_LEN: usize = 70; // 66 + 2 (fee_to_insurance_bps) + 2 (skew_spread_mult_bps)
+pub const INIT_CTX_LEN: usize = 78; // 70 + 8 (lp_account_id)
 
 #[derive(Clone, Copy, Debug)]
 pub struct InitParams {
@@ -269,6 +290,9 @@ pub struct InitParams {
     pub max_inventory_abs: u128,
     pub fee_to_insurance_bps: u16,
     pub skew_spread_mult_bps: u16,
+    /// Numeric LP account identifier, echoed in every MatcherReturn and validated on
+    /// each call to prevent cross-market instruction replay.
+    pub lp_account_id: u64,
 }
 
 impl InitParams {
@@ -290,6 +314,7 @@ impl InitParams {
             max_inventory_abs: u128::from_le_bytes(data[50..66].try_into().unwrap()),
             fee_to_insurance_bps: u16::from_le_bytes(data[66..68].try_into().unwrap()),
             skew_spread_mult_bps: u16::from_le_bytes(data[68..70].try_into().unwrap()),
+            lp_account_id: u64::from_le_bytes(data[70..78].try_into().unwrap()),
         })
     }
 
@@ -306,6 +331,7 @@ impl InitParams {
         data[50..66].copy_from_slice(&self.max_inventory_abs.to_le_bytes());
         data[66..68].copy_from_slice(&self.fee_to_insurance_bps.to_le_bytes());
         data[68..70].copy_from_slice(&self.skew_spread_mult_bps.to_le_bytes());
+        data[70..78].copy_from_slice(&self.lp_account_id.to_le_bytes());
         data
     }
 }
@@ -371,7 +397,8 @@ pub fn process_init(
         fee_to_insurance_bps: params.fee_to_insurance_bps,
         skew_spread_mult_bps: params.skew_spread_mult_bps,
         _new_pad: [0; 4],
-        _reserved: [0; 96],
+        lp_account_id: params.lp_account_id,
+        _reserved: [0; 88],
     };
     ctx.validate()?;
 
@@ -404,10 +431,19 @@ pub fn process_call(
         return Err(ProgramError::InvalidAccountData);
     }
 
+    // 3E.2: Validate that the caller-supplied lp_account_id matches the value stored
+    // in the ctx at init time. Without this check a replayed or cross-market instruction
+    // could be accepted with a mismatched identifier that gets echoed in MatcherReturn.
+    if call.lp_account_id != ctx.lp_account_id {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
     let (exec_price, exec_size, flags) = compute_execution(&ctx, &call)?;
 
     if exec_size != 0 {
-        ctx.inventory_base = ctx.inventory_base.saturating_sub(exec_size);
+        // 3E.3: Use checked_sub to surface underflow rather than silently saturating.
+        ctx.inventory_base = ctx.inventory_base.checked_sub(exec_size)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
         ctx.last_oracle_price_e6 = call.oracle_price_e6;
         ctx.last_exec_price_e6 = exec_price;
 
@@ -701,12 +737,15 @@ mod tests {
             inventory_base: 0,
             last_oracle_price_e6: 0,
             last_exec_price_e6: 0,
-            max_inventory_abs: 0,
+            // 3E.4: max_inventory_abs must be non-zero; use a large sentinel for tests
+            // that don't specifically exercise the inventory limit.
+            max_inventory_abs: u128::MAX,
             insurance_accrued_e6: 0,
             fee_to_insurance_bps: 0,
             skew_spread_mult_bps: 0,
             _new_pad: [0; 4],
-            _reserved: [0; 96],
+            lp_account_id: 100,
+            _reserved: [0; 88],
         }
     }
 
@@ -726,12 +765,13 @@ mod tests {
             inventory_base: 0,
             last_oracle_price_e6: 0,
             last_exec_price_e6: 0,
-            max_inventory_abs: 0,
+            max_inventory_abs: u128::MAX,
             insurance_accrued_e6: 0,
             fee_to_insurance_bps: 0,
             skew_spread_mult_bps: 0,
             _new_pad: [0; 4],
-            _reserved: [0; 96],
+            lp_account_id: 100,
+            _reserved: [0; 88],
         }
     }
 
@@ -897,12 +937,14 @@ mod tests {
             max_inventory_abs: 500_000,
             fee_to_insurance_bps: 500,
             skew_spread_mult_bps: 10,
+            lp_account_id: 42,
         };
         let encoded = params.encode();
         let decoded = InitParams::parse(&encoded).unwrap();
         assert_eq!(params.kind, decoded.kind);
         assert_eq!(params.fee_to_insurance_bps, decoded.fee_to_insurance_bps);
         assert_eq!(params.skew_spread_mult_bps, decoded.skew_spread_mult_bps);
+        assert_eq!(params.lp_account_id, decoded.lp_account_id);
     }
 
     // --- NEW: Skew-aware inventory tests ---
@@ -1005,6 +1047,72 @@ mod tests {
         ctx.fee_to_insurance_bps = 10_001;
         assert!(ctx.validate().is_err());
     }
+
+    // --- Audit fix tests (3E.1 – 3E.5) ---
+
+    // 3E.1: validate() must reject wrong version.
+    #[test]
+    fn test_validation_rejects_wrong_version() {
+        let mut ctx = default_vamm_ctx();
+        ctx.version = MATCHER_VERSION - 1;
+        assert!(
+            ctx.validate().is_err(),
+            "validate() must reject version != MATCHER_VERSION"
+        );
+    }
+
+    #[test]
+    fn test_validation_accepts_correct_version() {
+        let ctx = default_vamm_ctx();
+        assert!(ctx.validate().is_ok());
+    }
+
+    // 3E.2: lp_account_id in ctx serialises/deserialises correctly.
+    #[test]
+    fn test_lp_account_id_roundtrip() {
+        let mut ctx = default_vamm_ctx();
+        ctx.lp_account_id = 0xDEAD_BEEF_CAFE_1234;
+        let mut buf = [0u8; CTX_VAMM_LEN];
+        ctx.write_to(&mut buf).unwrap();
+        let ctx2 = MatcherCtx::read_from(&buf).unwrap();
+        assert_eq!(ctx.lp_account_id, ctx2.lp_account_id);
+    }
+
+    // 3E.4: validate() must reject max_inventory_abs == 0.
+    #[test]
+    fn test_validation_rejects_zero_max_inventory_abs() {
+        let mut ctx = default_vamm_ctx();
+        ctx.max_inventory_abs = 0;
+        assert!(
+            ctx.validate().is_err(),
+            "validate() must reject max_inventory_abs == 0"
+        );
+    }
+
+    #[test]
+    fn test_validation_accepts_nonzero_max_inventory_abs() {
+        let mut ctx = default_vamm_ctx();
+        ctx.max_inventory_abs = 1;
+        assert!(ctx.validate().is_ok());
+    }
+
+    // 3E.5: validate() must reject skew_spread_mult_bps > 10_000.
+    #[test]
+    fn test_validation_rejects_skew_mult_over_10000() {
+        let mut ctx = default_vamm_ctx();
+        ctx.skew_spread_mult_bps = 10_001;
+        assert!(
+            ctx.validate().is_err(),
+            "validate() must reject skew_spread_mult_bps > 10_000"
+        );
+    }
+
+    #[test]
+    fn test_validation_accepts_skew_mult_at_10000() {
+        let mut ctx = default_vamm_ctx();
+        ctx.skew_spread_mult_bps = 10_000;
+        assert!(ctx.validate().is_ok());
+    }
 }
 
 // =============================================================================
@@ -1084,7 +1192,8 @@ mod proofs {
             fee_to_insurance_bps: 0,
             skew_spread_mult_bps: 0,
             _new_pad: [0; 4],
-            _reserved: [0; 96],
+            lp_account_id: 0,
+            _reserved: [0; 88],
         };
 
         let fill_abs = check_inventory_limit(&ctx, fill_req, is_buy).unwrap();
