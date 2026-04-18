@@ -44,7 +44,7 @@ Example with oracle price of 100,000:
 # Build for Solana
 cargo build-sbf
 
-# Run tests — 34 tests, 0 failures
+# Run tests — 47 tests, 0 failures
 cargo test
 ```
 
@@ -55,7 +55,7 @@ The compiled program is output to `target/deploy/percolator_match.so`.
 ### Setup
 
 1. Deploy the matcher program
-2. Create a context account owned by the matcher program (minimum 96 bytes, recommended 320 bytes)
+2. Create a context account owned by the matcher program (minimum 320 bytes)
 3. Initialize the context with the LP PDA (Tag 1 instruction)
 4. Register the LP with Percolator via `InitLP`, setting:
    - `matcher_program`: This program's deployed address
@@ -68,7 +68,7 @@ The compiled program is output to `target/deploy/percolator_match.so`.
 | 0-63 | return | 64 | Matcher return data (written on each call) - ABI required |
 | 64-95 | lp_pda | 32 | Stored LP PDA (set on init, verified on calls) |
 
-Minimum size: 96 bytes (percolator requires 320 bytes)
+Minimum size: 320 bytes (`MATCHER_CONTEXT_LEN = 320`)
 
 ## Instructions
 
@@ -108,7 +108,7 @@ Executes passive matching logic. Requires LP PDA to be a signer and match the st
 | 48-56 | oracle_price_e6 | u64 | Echo of oracle_price_e6 |
 | 56-64 | reserved | u64 | Always 0 |
 
-### Tag 1: Initialize
+### Tag 2: InitVamm
 
 Stores the LP PDA in the context account. Does not require PDA signature (passive init). Can only be called once.
 
@@ -123,7 +123,7 @@ Stores the LP PDA in the context account. Does not require PDA signature (passiv
 
 | Offset | Field | Type | Description |
 |--------|-------|------|-------------|
-| 0 | tag | u8 | Always 1 |
+| 0 | tag | u8 | Always 2 (`MATCHER_INIT_VAMM_TAG`) |
 
 ## Security
 
