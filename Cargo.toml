@@ -20,6 +20,8 @@ solana-program = "2.0"
 # 2024, breaking cargo build-sbf on toolchain 1.84.0. Pin blake3 to =1.8.1
 # (uses constant_time_eq ^0.3.1) until the SBF toolchain catches up.
 blake3 = "=1.8.1"
+# serde_json required by src/bin/sdk_parity_fixtures.rs (parity fixture binary)
+serde_json = "1"
 
 [dev-dependencies]
 

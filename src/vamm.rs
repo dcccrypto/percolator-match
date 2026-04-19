@@ -367,6 +367,9 @@ pub fn process_init(
         return Err(ProgramError::MissingRequiredSignature);
     }
 
+    if lp_pda.is_signer { solana_program::msg!("process_init: lp_pda signer=true"); } else { solana_program::msg!("process_init: lp_pda signer=false"); }
+    if ctx_account.owner == program_id { solana_program::msg!("process_init: ctx owner ok"); } else { solana_program::msg!("process_init: ctx owner WRONG"); }
+    if ctx_account.is_writable { solana_program::msg!("process_init: ctx writable=true"); } else { solana_program::msg!("process_init: ctx writable=FALSE"); }
     if ctx_account.owner != program_id {
         return Err(ProgramError::IncorrectProgramId);
     }
