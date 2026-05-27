@@ -52,14 +52,14 @@ fn main() {
         "req_id":           32,
         "lp_account_id":    40,
         "oracle_price_e6":  48,
-        "reserved":         56,
+        "asset_index":      56,
     });
 
     // MatcherCall instruction data field offsets
     let call_field_offsets = json!({
         "tag":              0,
         "req_id":           1,
-        "lp_idx":           9,
+        "asset_index":      9,
         "lp_account_id":    11,
         "oracle_price_e6":  19,
         "req_size":         27,

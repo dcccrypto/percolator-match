@@ -22,10 +22,11 @@ fn tag_matcher_init_vamm_is_2() {
 }
 
 #[test]
-fn abi_version_is_2() {
+fn abi_version_is_3() {
     // MATCHER_ABI_VERSION is echoed in every MatcherReturn. The SDK and keeper both assert
-    // this value; bumping it without coordinating breaks all active markets.
-    assert_eq!(MATCHER_ABI_VERSION, 2u32, "MATCHER_ABI_VERSION must be 2 — breaking change");
+    // this value; bumping it without coordinating breaks all active markets. v3 added
+    // the `asset_index` echo field replacing v2's `reserved` u64.
+    assert_eq!(MATCHER_ABI_VERSION, 3u32, "MATCHER_ABI_VERSION must be 3 — breaking change");
 }
 
 // ---------------------------------------------------------------------------

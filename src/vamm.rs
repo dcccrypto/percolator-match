@@ -476,7 +476,7 @@ pub fn process_call(
         req_id: call.req_id,
         lp_account_id: call.lp_account_id,
         oracle_price_e6: call.oracle_price_e6,
-        reserved: 0,
+        asset_index: call.asset_index as u64,
     };
 
     let mut data = ctx_account.try_borrow_mut_data()?;
@@ -803,7 +803,7 @@ mod tests {
     fn make_call(oracle_price: u64, req_size: i128) -> MatcherCall {
         MatcherCall {
             req_id: 1,
-            lp_idx: 0,
+            asset_index: 0,
             lp_account_id: 100,
             oracle_price_e6: oracle_price,
             req_size,

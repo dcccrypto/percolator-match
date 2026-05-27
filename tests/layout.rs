@@ -48,7 +48,7 @@ fn matcher_context_len_is_320() {
 
 #[test]
 fn matcher_call_len_is_67() {
-    // tag(1) + req_id(8) + lp_idx(2) + lp_account_id(8) + oracle_price_e6(8) +
+    // tag(1) + req_id(8) + asset_index(2) + lp_account_id(8) + oracle_price_e6(8) +
     // req_size(16) + padding(24) = 67
     assert_eq!(MATCHER_CALL_LEN, 67);
 }
@@ -80,14 +80,14 @@ fn matcher_return_struct_size() {
 #[test]
 fn matcher_return_field_offsets_via_write_to() {
     let ret = MatcherReturn {
-        abi_version: 0x0000_0002,
+        abi_version: 0x0000_0003,
         flags: 0x0000_0001,
         exec_price_e6: 0x0102_0304_0506_0708,
         exec_size: 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10_i128,
         req_id: 0xAA_BB_CC_DD_EE_FF_00_11,
         lp_account_id: 0x11_22_33_44_55_66_77_88,
         oracle_price_e6: 0xCA_FE_BA_BE_DE_AD_BE_EF,
-        reserved: 0,
+        asset_index: 0x0007,
     };
     let mut buf = [0u8; 64];
     ret.write_to(&mut buf).unwrap();
@@ -106,8 +106,8 @@ fn matcher_return_field_offsets_via_write_to() {
     assert_eq!(u64::from_le_bytes(buf[40..48].try_into().unwrap()), ret.lp_account_id);
     // oracle_price_e6 at 48..56
     assert_eq!(u64::from_le_bytes(buf[48..56].try_into().unwrap()), ret.oracle_price_e6);
-    // reserved at 56..64
-    assert_eq!(u64::from_le_bytes(buf[56..64].try_into().unwrap()), 0u64);
+    // asset_index at 56..64 (v3: replaces v2's `reserved`)
+    assert_eq!(u64::from_le_bytes(buf[56..64].try_into().unwrap()), ret.asset_index);
 }
 
 // ---------------------------------------------------------------------------
@@ -120,13 +120,13 @@ fn matcher_call_field_offsets() {
     let mut data = [0u8; 67];
     data[0] = 0u8; // tag
     let req_id: u64 = 0xDEAD_BEEF_CAFE_1234;
-    let lp_idx: u16 = 7;
+    let asset_index: u16 = 7;
     let lp_account_id: u64 = 0x1111_2222_3333_4444;
     let oracle_price_e6: u64 = 100_000_000;
     let req_size: i128 = -500_000;
 
     data[1..9].copy_from_slice(&req_id.to_le_bytes());
-    data[9..11].copy_from_slice(&lp_idx.to_le_bytes());
+    data[9..11].copy_from_slice(&asset_index.to_le_bytes());
     data[11..19].copy_from_slice(&lp_account_id.to_le_bytes());
     data[19..27].copy_from_slice(&oracle_price_e6.to_le_bytes());
     data[27..43].copy_from_slice(&req_size.to_le_bytes());
@@ -134,7 +134,7 @@ fn matcher_call_field_offsets() {
 
     let call = MatcherCall::parse(&data).unwrap();
     assert_eq!(call.req_id, req_id);
-    assert_eq!(call.lp_idx, lp_idx);
+    assert_eq!(call.asset_index, asset_index);
     assert_eq!(call.lp_account_id, lp_account_id);
     assert_eq!(call.oracle_price_e6, oracle_price_e6);
     assert_eq!(call.req_size, req_size);
