@@ -286,7 +286,12 @@ impl MatcherCtx {
 // Init Instruction (Tag 2) — extended with new fields
 // =============================================================================
 
-pub const INIT_CTX_LEN: usize = 78; // 70 + 8 (lp_account_id)
+/// v3-compat: 66-byte upstream payload. Fork additives (fee_to_insurance_bps,
+/// skew_spread_mult_bps, lp_account_id) sit at offsets 66-78 and default to 0
+/// when the caller sends only the upstream-shaped 66-byte init.
+pub const INIT_CTX_LEN_V3: usize = 66;
+/// Full fork init payload length including the 12 fork-additive bytes.
+pub const INIT_CTX_LEN: usize = 78;
 
 #[derive(Clone, Copy, Debug)]
 pub struct InitParams {
@@ -300,19 +305,22 @@ pub struct InitParams {
     pub max_inventory_abs: u128,
     pub fee_to_insurance_bps: u16,
     pub skew_spread_mult_bps: u16,
-    /// Numeric LP account identifier, echoed in every MatcherReturn and validated on
-    /// each call to prevent cross-market instruction replay.
+    /// Numeric LP account identifier. When non-zero, process_call validates
+    /// `call.lp_account_id == ctx.lp_account_id` (fork legacy 3E.2 hardening).
+    /// When zero (v3 upstream-shaped init), the check is skipped — the v16
+    /// matcher protocol relies on the lp_pda signer chain for authentication.
     pub lp_account_id: u64,
 }
 
 impl InitParams {
     pub fn parse(data: &[u8]) -> Result<Self, ProgramError> {
-        if data.len() < INIT_CTX_LEN {
+        if data.len() < INIT_CTX_LEN_V3 {
             return Err(ProgramError::InvalidInstructionData);
         }
         if data[0] != crate::MATCHER_INIT_VAMM_TAG {
             return Err(ProgramError::InvalidInstructionData);
         }
+        let extended = data.len() >= INIT_CTX_LEN;
         Ok(Self {
             kind: data[1],
             trading_fee_bps: u32::from_le_bytes(data[2..6].try_into().unwrap()),
@@ -322,9 +330,21 @@ impl InitParams {
             liquidity_notional_e6: u128::from_le_bytes(data[18..34].try_into().unwrap()),
             max_fill_abs: u128::from_le_bytes(data[34..50].try_into().unwrap()),
             max_inventory_abs: u128::from_le_bytes(data[50..66].try_into().unwrap()),
-            fee_to_insurance_bps: u16::from_le_bytes(data[66..68].try_into().unwrap()),
-            skew_spread_mult_bps: u16::from_le_bytes(data[68..70].try_into().unwrap()),
-            lp_account_id: u64::from_le_bytes(data[70..78].try_into().unwrap()),
+            fee_to_insurance_bps: if extended {
+                u16::from_le_bytes(data[66..68].try_into().unwrap())
+            } else {
+                0
+            },
+            skew_spread_mult_bps: if extended {
+                u16::from_le_bytes(data[68..70].try_into().unwrap())
+            } else {
+                0
+            },
+            lp_account_id: if extended {
+                u64::from_le_bytes(data[70..78].try_into().unwrap())
+            } else {
+                0
+            },
         })
     }
 
@@ -435,10 +455,13 @@ pub fn process_call(
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // 3E.2: Validate that the caller-supplied lp_account_id matches the value stored
-    // in the ctx at init time. Without this check a replayed or cross-market instruction
-    // could be accepted with a mismatched identifier that gets echoed in MatcherReturn.
-    if call.lp_account_id != ctx.lp_account_id {
+    // 3E.2 (v3-compat): Validate caller-supplied lp_account_id against the stored
+    // ctx value ONLY when ctx.lp_account_id was explicitly set at init (non-zero).
+    // v16's 66-byte upstream init payload leaves lp_account_id = 0, in which case
+    // the v16 protocol relies on the lp_pda signer chain (PM-3) for authentication
+    // and the 3E.2 belt-and-braces check is skipped. Fork-extended 78-byte init
+    // (legacy flow) still enforces the original 3E.2 hardening.
+    if ctx.lp_account_id != 0 && call.lp_account_id != ctx.lp_account_id {
         return Err(ProgramError::InvalidInstructionData);
     }
 
