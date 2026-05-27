@@ -208,6 +208,20 @@ fn process_matcher_call(
     if ctx_account.data_len() < MATCHER_CONTEXT_LEN {
         return Err(ProgramError::AccountDataTooSmall);
     }
+    // PM-1: mirror the writable check in `process_init`. Without this guard the
+    // mutable borrow below (try_borrow_mut_data for return + ctx writes) would
+    // surface only as an opaque runtime error; an explicit check at the
+    // validation boundary keeps the failure mode auditable and prevents future
+    // refactors from silently dropping the guard.
+    if !ctx_account.is_writable {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // PM-3: signer check before any account-data inspection. Without this an
+    // unauthenticated caller could distinguish initialized from uninitialized
+    // ctx accounts via error-code observation.
+    if !lp_pda.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
     let is_initialized = {
         let ctx_data = ctx_account.try_borrow_data()?;
@@ -216,9 +230,6 @@ fn process_matcher_call(
 
     if !is_initialized {
         return Err(ProgramError::UninitializedAccount);
-    }
-    if !lp_pda.is_signer {
-        return Err(ProgramError::MissingRequiredSignature);
     }
 
     vamm::process_call(lp_pda, ctx_account, instruction_data)
