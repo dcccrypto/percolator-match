@@ -149,13 +149,18 @@ account).
 
 ### Tag 2: InitVamm
 
-Stores the LP PDA in the context account. Does not require PDA signature (passive init). Can only be called once.
+Stores the LP PDA in the context account. Can only be called once.
+
+**The LP PDA must sign** `InitVamm` (PERC-321) — the code enforces `lp_pda.is_signer`
+(`src/lib.rs`). Otherwise anyone could initialise an uninitialised, program-owned context
+account with attacker-controlled parameters and lock out the intended LP via the
+one-time-init guard.
 
 #### Accounts
 
 | Index | Name | Type | Description |
 |-------|------|------|-------------|
-| 0 | lp_pda | - | LP PDA to store (no signature required) |
+| 0 | lp_pda | Signer | LP PDA to store (must sign) |
 | 1 | matcher_ctx | Writable | Context account owned by this program |
 
 #### Instruction Data (1 byte)
