@@ -43,7 +43,8 @@ fn vamm_ctx(
         skew_spread_mult_bps: 0,
         _new_pad: [0; 4],
         lp_account_id: 42,
-        _reserved: [0; 88],
+        insurance_fee_remainder_e6: 0,
+        _reserved: [0; 80],
     }
 }
 
@@ -74,7 +75,8 @@ fn passive_ctx(
         skew_spread_mult_bps: 0,
         _new_pad: [0; 4],
         lp_account_id: 42,
-        _reserved: [0; 88],
+        insurance_fee_remainder_e6: 0,
+        _reserved: [0; 80],
     }
 }
 

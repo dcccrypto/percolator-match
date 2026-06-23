@@ -66,11 +66,13 @@ pub const MATCHER_VERSION: u32 = 4; // Bumped from 3 for new fields
 /// 120     8     last_exec_price_e6
 /// 128     16    max_inventory_abs
 /// --- NEW FIELDS (carved from reserved) ---
-/// 144     2     fee_to_insurance_bps (portion of trading_fee routed to insurance)
-/// 146     2     skew_spread_mult_bps (extra spread multiplier per inventory unit, 0=disabled)
-/// 148     8     insurance_accrued_e6 (accumulated insurance fee, read-only for cranker)
-/// 156     8     lp_account_id (numeric LP identifier, must match instruction data)
-/// 164     92    _reserved
+/// 144     8     insurance_accrued_e6 (accumulated insurance fee, read-only for cranker)
+/// 152     2     fee_to_insurance_bps (portion of trading_fee routed to insurance)
+/// 154     2     skew_spread_mult_bps (extra spread multiplier per inventory unit, 0=disabled)
+/// 156     4     _new_pad
+/// 160     8     lp_account_id (numeric LP identifier, must match instruction data)
+/// 168     8     insurance_fee_remainder_e6 (fractional insurance fee carried across calls)
+/// 176     80    _reserved
 /// ```
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -116,8 +118,14 @@ pub struct MatcherCtx {
     /// Set at init from InitParams; validated in process_call to prevent cross-market spoofing.
     pub lp_account_id: u64, // 8 bytes, offset 160
 
-    // Reserved (88 bytes)
-    pub _reserved: [u8; 88],
+    /// Fractional insurance fee (in e6 units, scaled by 1e14) left over from the last
+    /// fill's floor-division, carried forward so a fill split across many small calls
+    /// accrues the same total insurance fee as one equivalent-size fill. See
+    /// `compute_insurance_fee`.
+    pub insurance_fee_remainder_e6: u64, // 8 bytes, offset 168
+
+    // Reserved (80 bytes)
+    pub _reserved: [u8; 80],
 }
 
 const _: () = assert!(core::mem::size_of::<MatcherCtx>() == CTX_VAMM_LEN);
@@ -145,7 +153,8 @@ impl Default for MatcherCtx {
             skew_spread_mult_bps: 0,
             _new_pad: [0; 4],
             lp_account_id: 0,
-            _reserved: [0; 88],
+            insurance_fee_remainder_e6: 0,
+            _reserved: [0; 80],
         }
     }
 }
@@ -169,8 +178,8 @@ impl MatcherCtx {
 
         let mut lp_pda = [0u8; 32];
         lp_pda.copy_from_slice(&data[16..48]);
-        let mut reserved = [0u8; 88];
-        reserved.copy_from_slice(&data[168..256]);
+        let mut reserved = [0u8; 80];
+        reserved.copy_from_slice(&data[176..256]);
 
         Ok(Self {
             magic,
@@ -193,6 +202,7 @@ impl MatcherCtx {
             skew_spread_mult_bps: u16::from_le_bytes(data[154..156].try_into().unwrap()),
             _new_pad: [0; 4],
             lp_account_id: u64::from_le_bytes(data[160..168].try_into().unwrap()),
+            insurance_fee_remainder_e6: u64::from_le_bytes(data[168..176].try_into().unwrap()),
             _reserved: reserved,
         })
     }
@@ -221,7 +231,8 @@ impl MatcherCtx {
         data[154..156].copy_from_slice(&self.skew_spread_mult_bps.to_le_bytes());
         data[156..160].copy_from_slice(&self._new_pad);
         data[160..168].copy_from_slice(&self.lp_account_id.to_le_bytes());
-        data[168..256].copy_from_slice(&self._reserved);
+        data[168..176].copy_from_slice(&self.insurance_fee_remainder_e6.to_le_bytes());
+        data[176..256].copy_from_slice(&self._reserved);
         Ok(())
     }
 
@@ -433,7 +444,8 @@ pub fn process_init(
         skew_spread_mult_bps: params.skew_spread_mult_bps,
         _new_pad: [0; 4],
         lp_account_id: params.lp_account_id,
-        _reserved: [0; 88],
+        insurance_fee_remainder_e6: 0,
+        _reserved: [0; 80],
     };
     ctx.validate()?;
 
@@ -487,13 +499,14 @@ pub fn process_call(
 
         // Accrue insurance fee
         if ctx.fee_to_insurance_bps > 0 {
-            let insurance_fee = compute_insurance_fee(&ctx, exec_size, exec_price);
+            let (insurance_fee, remainder) = compute_insurance_fee(&ctx, exec_size, exec_price);
             // PERC-321: Use checked_add to detect overflow instead of silently
             // saturating (which would lose insurance fees at u64::MAX).
             ctx.insurance_accrued_e6 = ctx
                 .insurance_accrued_e6
                 .checked_add(insurance_fee)
                 .ok_or(ProgramError::ArithmeticOverflow)?;
+            ctx.insurance_fee_remainder_e6 = remainder;
         }
     }
 
@@ -584,11 +597,13 @@ pub fn process_batch_call(
 
             // Accrue insurance fee per-leg, same as single-fill path.
             if ctx.fee_to_insurance_bps > 0 {
-                let insurance_fee = compute_insurance_fee(&ctx, exec_size, exec_price);
+                let (insurance_fee, remainder) =
+                    compute_insurance_fee(&ctx, exec_size, exec_price);
                 ctx.insurance_accrued_e6 = ctx
                     .insurance_accrued_e6
                     .checked_add(insurance_fee)
                     .ok_or(ProgramError::ArithmeticOverflow)?;
+                ctx.insurance_fee_remainder_e6 = remainder;
             }
         }
         let ret = MatcherReturn {
@@ -661,15 +676,33 @@ fn compute_skew_extra_bps(ctx: &MatcherCtx, is_buy: bool) -> u128 {
     core::cmp::min(extra, 5000)
 }
 
-/// Compute insurance fee from a fill: fee_notional * (trading_fee_bps / 10_000) * (fee_to_insurance_bps / 10_000)
-/// Returns fee in e6 units.
-fn compute_insurance_fee(ctx: &MatcherCtx, exec_size: i128, exec_price: u64) -> u64 {
+/// Combined denominator for `compute_insurance_fee`'s single fused division:
+/// notional (1e6) * trading_fee_bps (1e4) * fee_to_insurance_bps (1e4) = 1e14.
+const INSURANCE_FEE_DENOM: u128 = 1_000_000u128 * 10_000 * 10_000;
+
+/// Compute insurance fee owed for a fill: size * price * (trading_fee_bps / 10_000) *
+/// (fee_to_insurance_bps / 10_000), in e6 units.
+///
+/// BUG-101: the previous implementation floor-divided in three separate stages
+/// (notional, then trading fee, then insurance portion) and discarded the
+/// remainder at each stage on every call. Splitting one fill into many small
+/// calls/legs made each individual call round its insurance slice down to zero,
+/// so the insurance fund accrued nothing even though the aggregate notional
+/// traded was identical to one unsplit fill. This version performs a single
+/// fused division and carries the fractional remainder forward via
+/// `ctx.insurance_fee_remainder_e6`, so the total accrued across any split of
+/// the same aggregate fill is the same (modulo a single final unit of rounding).
+/// Returns `(fee to accrue this call, new remainder to store in ctx)`.
+fn compute_insurance_fee(ctx: &MatcherCtx, exec_size: i128, exec_price: u64) -> (u64, u64) {
     let abs_size = exec_size.unsigned_abs();
-    let notional_e6 = abs_size.saturating_mul(exec_price as u128) / 1_000_000;
-    let fee_portion = notional_e6.saturating_mul(ctx.trading_fee_bps as u128) / 10_000;
-    let insurance_portion = fee_portion.saturating_mul(ctx.fee_to_insurance_bps as u128) / 10_000;
-    // Saturate to u64
-    core::cmp::min(insurance_portion, u64::MAX as u128) as u64
+    let numerator = abs_size
+        .saturating_mul(exec_price as u128)
+        .saturating_mul(ctx.trading_fee_bps as u128)
+        .saturating_mul(ctx.fee_to_insurance_bps as u128)
+        .saturating_add(ctx.insurance_fee_remainder_e6 as u128);
+    let fee = numerator / INSURANCE_FEE_DENOM;
+    let remainder = (numerator % INSURANCE_FEE_DENOM) as u64;
+    (core::cmp::min(fee, u64::MAX as u128) as u64, remainder)
 }
 
 fn compute_passive_execution(
@@ -898,7 +931,8 @@ mod tests {
             skew_spread_mult_bps: 0,
             _new_pad: [0; 4],
             lp_account_id: 100,
-            _reserved: [0; 88],
+            insurance_fee_remainder_e6: 0,
+            _reserved: [0; 80],
         }
     }
 
@@ -924,7 +958,8 @@ mod tests {
             skew_spread_mult_bps: 0,
             _new_pad: [0; 4],
             lp_account_id: 100,
-            _reserved: [0; 88],
+            insurance_fee_remainder_e6: 0,
+            _reserved: [0; 80],
         }
     }
 
@@ -1167,7 +1202,7 @@ mod tests {
         // notional_e6 = 1_000_000 * 100_000_000 / 1_000_000 = 100_000_000
         // fee_portion = 100_000_000 * 100 / 10_000 = 1_000_000
         // insurance = 1_000_000 * 500 / 10_000 = 50_000
-        let fee = compute_insurance_fee(&ctx, 1_000_000, 100_000_000);
+        let (fee, _remainder) = compute_insurance_fee(&ctx, 1_000_000, 100_000_000);
         assert_eq!(fee, 50_000);
     }
 
@@ -1177,7 +1212,7 @@ mod tests {
             fee_to_insurance_bps: 0,
             ..default_vamm_ctx()
         };
-        let fee = compute_insurance_fee(&ctx, 1_000_000, 100_000_000);
+        let (fee, _remainder) = compute_insurance_fee(&ctx, 1_000_000, 100_000_000);
         assert_eq!(fee, 0);
     }
 
@@ -1189,9 +1224,38 @@ mod tests {
             fee_to_insurance_bps: 500,
             ..default_vamm_ctx()
         };
-        let fee_pos = compute_insurance_fee(&ctx, 1_000_000, 100_000_000);
-        let fee_neg = compute_insurance_fee(&ctx, -1_000_000, 100_000_000);
+        let (fee_pos, _) = compute_insurance_fee(&ctx, 1_000_000, 100_000_000);
+        let (fee_neg, _) = compute_insurance_fee(&ctx, -1_000_000, 100_000_000);
         assert_eq!(fee_pos, fee_neg);
+    }
+
+    #[test]
+    fn test_insurance_fee_remainder_carries_across_split_calls() {
+        // BUG-101 regression: splitting one fill into many tiny calls must accrue
+        // the same total insurance fee as one unsplit call of equivalent size,
+        // instead of each call rounding its slice down to zero.
+        let ctx = MatcherCtx {
+            trading_fee_bps: 5,
+            fee_to_insurance_bps: 500,
+            ..default_vamm_ctx()
+        };
+        let exec_price = 100_000_000u64;
+
+        let (fee_unsplit, _) = compute_insurance_fee(&ctx, 1000, exec_price);
+        assert!(fee_unsplit > 0, "sanity: unsplit fill should accrue a nonzero fee");
+
+        let mut split_ctx = ctx;
+        let mut total_split_fee: u64 = 0;
+        for _ in 0..1000 {
+            let (fee, remainder) = compute_insurance_fee(&split_ctx, 1, exec_price);
+            total_split_fee = total_split_fee.checked_add(fee).unwrap();
+            split_ctx.insurance_fee_remainder_e6 = remainder;
+        }
+
+        assert_eq!(
+            total_split_fee, fee_unsplit,
+            "1000 size-1 calls must accrue the same total insurance fee as one size-1000 call"
+        );
     }
 
     #[test]
@@ -1582,7 +1646,8 @@ mod proofs {
             skew_spread_mult_bps: 0,
             _new_pad: [0; 4],
             lp_account_id: 0,
-            _reserved: [0; 88],
+            insurance_fee_remainder_e6: 0,
+            _reserved: [0; 80],
         };
 
         let fill_abs = check_inventory_limit(&ctx, fill_req, is_buy).unwrap();
@@ -1604,8 +1669,24 @@ mod proofs {
         );
     }
 
-    /// Proof 3: insurance_accrued_e6 never exceeds fee_portion (fee is fraction of trading fee).
-    /// Specifically: insurance_fee ≤ notional * trading_fee_bps / 10_000.
+    /// Proof 3: insurance_accrued_e6 never exceeds (a fraction of) the trading fee
+    /// notional by more than one unit of carried-remainder slack.
+    ///
+    /// BUG-101 changed `compute_insurance_fee` from three independently-floored
+    /// stages (notional, then trading fee, then insurance portion — each
+    /// discarding its own remainder) to a single fused division that carries the
+    /// fractional remainder forward in `ctx.insurance_fee_remainder_e6`. The old
+    /// per-call bound ("insurance_fee ≤ floor(floor(notional)*fee_bps/1e4)") no
+    /// longer applies as-is: removing the intermediate notional floor means a
+    /// single call's fee can be exactly one unit higher than the old doubly-floored
+    /// reference even with zero incoming remainder (verified by hand: abs_size=
+    /// 3_333_999_999, exec_price=1, trading_fee_bps=3, fee_to_insurance_bps=10_000
+    /// gives old-style full_trading_fee=0 but the new fused fee=1), and the carried
+    /// remainder itself (always < 1e14) can push a call's result up by at most one
+    /// further unit. The bound below — full_trading_fee computed via the same
+    /// un-staged division my implementation uses, plus 2 — accounts for both
+    /// effects and is what should actually hold for any single call regardless of
+    /// incoming remainder.
     #[kani::proof]
     #[kani::unwind(1)]
     fn proof_insurance_fee_bounded_by_trading_fee() {
@@ -1622,23 +1703,30 @@ mod proofs {
         let fee_to_insurance_bps: u16 = kani::any();
         kani::assume(fee_to_insurance_bps <= 10_000);
 
+        let incoming_remainder: u64 = kani::any();
+        kani::assume((incoming_remainder as u128) < INSURANCE_FEE_DENOM);
+
         let ctx = MatcherCtx {
             trading_fee_bps,
             fee_to_insurance_bps,
+            insurance_fee_remainder_e6: incoming_remainder,
             ..MatcherCtx::default()
         };
 
-        let insurance_fee = compute_insurance_fee(&ctx, exec_size, exec_price);
+        let (insurance_fee, _new_remainder) = compute_insurance_fee(&ctx, exec_size, exec_price);
 
-        // Full trading fee
+        // Un-staged trading fee reference, consistent with the single fused
+        // division compute_insurance_fee now performs (no intermediate floor).
         let abs_size = exec_size.unsigned_abs();
-        let notional_e6 = abs_size.saturating_mul(exec_price as u128) / 1_000_000;
-        let full_trading_fee = notional_e6.saturating_mul(trading_fee_bps as u128) / 10_000;
+        let full_trading_fee =
+            abs_size.saturating_mul(exec_price as u128).saturating_mul(trading_fee_bps as u128)
+                / 10_000_000_000u128;
 
-        // PROPERTY: insurance fee ≤ full trading fee
+        // PROPERTY: insurance fee ≤ full trading fee + 2 (one unit for dropping the
+        // intermediate notional floor, one unit for the carried remainder).
         assert!(
-            (insurance_fee as u128) <= full_trading_fee,
-            "insurance {} > trading fee {}",
+            (insurance_fee as u128) <= full_trading_fee.saturating_add(2),
+            "insurance {} > trading fee {} + 2",
             insurance_fee,
             full_trading_fee
         );
@@ -1897,7 +1985,8 @@ mod proofs {
             skew_spread_mult_bps: 0,
             _new_pad: [0; 4],
             lp_account_id: 1,
-            _reserved: [0; 88],
+            insurance_fee_remainder_e6: 0,
+            _reserved: [0; 80],
         };
         assert!(
             ctx_inv.validate().is_err(),

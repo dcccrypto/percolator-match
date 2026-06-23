@@ -204,7 +204,8 @@ fn matcher_ctx_field_offsets_via_serialization() {
         skew_spread_mult_bps: 0x0EEE,
         _new_pad: [0u8; 4],
         lp_account_id: 0xCAFE_BABE_1234_5678u64,
-        _reserved: [0u8; 88],
+        insurance_fee_remainder_e6: 0x5566_7788_99AA_BBCCu64,
+        _reserved: [0u8; 80],
     };
 
     let mut buf = [0u8; 256];
@@ -250,8 +251,13 @@ fn matcher_ctx_field_offsets_via_serialization() {
     assert_eq!(&buf[156..160], &[0u8; 4]);
     // lp_account_id at 160..168
     assert_eq!(u64::from_le_bytes(buf[160..168].try_into().unwrap()), ctx.lp_account_id);
-    // _reserved at 168..256 — zeros
-    assert_eq!(&buf[168..256], &[0u8; 88]);
+    // insurance_fee_remainder_e6 at 168..176
+    assert_eq!(
+        u64::from_le_bytes(buf[168..176].try_into().unwrap()),
+        ctx.insurance_fee_remainder_e6
+    );
+    // _reserved at 176..256 — zeros
+    assert_eq!(&buf[176..256], &[0u8; 80]);
 }
 
 // ---------------------------------------------------------------------------
