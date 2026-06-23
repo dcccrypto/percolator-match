@@ -394,6 +394,13 @@ pub fn process_init(
     if !ctx_account.is_writable {
         return Err(ProgramError::InvalidAccountData);
     }
+    // Signer check before any account-data inspection (PM-3 pattern, PERC-321).
+    // Without this, an unauthenticated caller could initialize an uninitialized,
+    // program-owned context account with attacker-controlled parameters and
+    // permanently lock out the intended LP via the one-time-init guard.
+    if !lp_pda.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
     let params = InitParams::parse(instruction_data)?;
     let _ = MatcherKind::try_from(params.kind)?;
@@ -1098,6 +1105,106 @@ mod tests {
         assert_eq!(params.fee_to_insurance_bps, decoded.fee_to_insurance_bps);
         assert_eq!(params.skew_spread_mult_bps, decoded.skew_spread_mult_bps);
         assert_eq!(params.lp_account_id, decoded.lp_account_id);
+    }
+
+    // --- BUG-001 regression: process_init must require lp_pda.is_signer ---
+
+    fn make_init_account_infos<'a>(
+        lp_key: &'a Pubkey,
+        lp_is_signer: bool,
+        lp_lamports: &'a mut u64,
+        ctx_key: &'a Pubkey,
+        ctx_lamports: &'a mut u64,
+        ctx_data: &'a mut [u8],
+        program_id: &'a Pubkey,
+    ) -> [AccountInfo<'a>; 2] {
+        [
+            AccountInfo::new(
+                lp_key,
+                lp_is_signer,
+                false,
+                lp_lamports,
+                &mut [],
+                program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                ctx_key,
+                false,
+                true,
+                ctx_lamports,
+                ctx_data,
+                program_id,
+                false,
+                0,
+            ),
+        ]
+    }
+
+    fn default_init_params() -> InitParams {
+        InitParams {
+            kind: MatcherKind::Vamm as u8,
+            trading_fee_bps: 5,
+            base_spread_bps: 10,
+            max_total_bps: 200,
+            impact_k_bps: 100,
+            liquidity_notional_e6: 1_000_000_000_000,
+            max_fill_abs: 1_000_000_000,
+            max_inventory_abs: 500_000,
+            fee_to_insurance_bps: 0,
+            skew_spread_mult_bps: 0,
+            lp_account_id: 42,
+        }
+    }
+
+    #[test]
+    fn test_init_rejects_non_signing_lp_pda() {
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique();
+        let ctx_key = Pubkey::new_unique();
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let mut ctx_data = [0u8; MATCHER_CONTEXT_LEN];
+
+        let accounts = make_init_account_infos(
+            &lp_key,
+            false, // attacker does not sign
+            &mut lp_lamports,
+            &ctx_key,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+        );
+
+        let data = default_init_params().encode();
+        let result = process_init(&program_id, &accounts, &data);
+        assert_eq!(result, Err(ProgramError::MissingRequiredSignature));
+    }
+
+    #[test]
+    fn test_init_succeeds_with_signing_lp_pda() {
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique();
+        let ctx_key = Pubkey::new_unique();
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let mut ctx_data = [0u8; MATCHER_CONTEXT_LEN];
+
+        let accounts = make_init_account_infos(
+            &lp_key,
+            true, // legitimate LP signs
+            &mut lp_lamports,
+            &ctx_key,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+        );
+
+        let data = default_init_params().encode();
+        let result = process_init(&program_id, &accounts, &data);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        assert!(MatcherCtx::is_initialized(&ctx_data[CTX_VAMM_OFFSET..]));
     }
 
     // --- NEW: Skew-aware inventory tests ---

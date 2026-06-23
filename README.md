@@ -152,8 +152,8 @@ account).
 Stores the LP PDA in the context account. Can only be called once.
 
 **The LP PDA must sign** `InitVamm` (PERC-321) — the code enforces `lp_pda.is_signer`
-(`src/lib.rs`). Otherwise anyone could initialise an uninitialised, program-owned context
-account with attacker-controlled parameters and lock out the intended LP via the
+(`src/vamm.rs::process_init`). Otherwise anyone could initialise an uninitialised, program-owned
+context account with attacker-controlled parameters and lock out the intended LP via the
 one-time-init guard.
 
 #### Accounts
