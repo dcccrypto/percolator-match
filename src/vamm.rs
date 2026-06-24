@@ -412,6 +412,11 @@ pub fn process_init(
     if !lp_pda.is_signer {
         return Err(ProgramError::MissingRequiredSignature);
     }
+    // F-02: Ensure lp_pda is a program derived address (off-curve) to prevent
+    // any caller-controlled keypair from acting as LP PDA.
+    if lp_pda.key.is_on_curve() {
+        return Err(ProgramError::InvalidAccountData);
+    }
 
     let params = InitParams::parse(instruction_data)?;
     let _ = MatcherKind::try_from(params.kind)?;
@@ -1205,7 +1210,7 @@ mod tests {
     #[test]
     fn test_init_rejects_non_signing_lp_pda() {
         let program_id = Pubkey::new_unique();
-        let lp_key = Pubkey::new_unique();
+        let (lp_key, _) = Pubkey::find_program_address(&[b"lp_pda_test"], &program_id);
         let ctx_key = Pubkey::new_unique();
         let mut lp_lamports = 0u64;
         let mut ctx_lamports = 0u64;
@@ -1229,7 +1234,7 @@ mod tests {
     #[test]
     fn test_init_succeeds_with_signing_lp_pda() {
         let program_id = Pubkey::new_unique();
-        let lp_key = Pubkey::new_unique();
+        let (lp_key, _) = Pubkey::find_program_address(&[b"lp_pda_test"], &program_id);
         let ctx_key = Pubkey::new_unique();
         let mut lp_lamports = 0u64;
         let mut ctx_lamports = 0u64;
@@ -1249,6 +1254,30 @@ mod tests {
         let result = process_init(&program_id, &accounts, &data);
         assert!(result.is_ok(), "expected Ok, got {:?}", result);
         assert!(MatcherCtx::is_initialized(&ctx_data[CTX_VAMM_OFFSET..]));
+    }
+
+    #[test]
+    fn test_init_rejects_on_curve_lp_pda() {
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique(); // on-curve
+        let ctx_key = Pubkey::new_unique();
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let mut ctx_data = [0u8; MATCHER_CONTEXT_LEN];
+
+        let accounts = make_init_account_infos(
+            &lp_key,
+            true, // signer is true
+            &mut lp_lamports,
+            &ctx_key,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+        );
+
+        let data = default_init_params().encode();
+        let result = process_init(&program_id, &accounts, &data);
+        assert_eq!(result, Err(ProgramError::InvalidAccountData));
     }
 
     // --- NEW: Skew-aware inventory tests ---
