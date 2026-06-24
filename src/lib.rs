@@ -75,6 +75,32 @@ pub const FLAG_PARTIAL_OK: u32 = 2;
 pub const FLAG_REJECTED: u32 = 4;
 pub const MATCHER_ABI_VERSION: u32 = 3;
 
+// =============================================================================
+// Oracle Price Validation Constants
+// =============================================================================
+
+/// Upper sanity ceiling for a caller-supplied `oracle_price_e6`.
+///
+/// Prices are denominated in 1e-6 USD (i.e., a $1.00 asset is 1_000_000). The
+/// largest plausible real-world perp asset is ~$1 000 000 per unit, which is
+/// 1_000_000_000_000 (1e12) in E6. This ceiling is 1_000× that (1e15), leaving
+/// ample room for any extreme-price asset while still catching obviously-corrupt
+/// or adversarially-crafted inputs (e.g., u64::MAX ≈ 1.8e19). Any single E6
+/// price above 1e15 would correspond to a per-unit value > $1 billion — an input
+/// that cannot be a legitimate price quote from any real market.
+///
+/// This constant is intentionally conservative: it does NOT constrain the market;
+/// it only rejects inputs that are structurally impossible.
+pub const ORACLE_PRICE_E6_MAX: u64 = 1_000_000_000_000_000; // 1e15 in E6 = $1B per unit
+
+/// `ProgramError::Custom` discriminant for a batch call where the same
+/// `asset_index` appears in more than one leg with different `oracle_price_e6`
+/// values. A legitimate caller (percolator-prog) reads all asset prices from one
+/// atomic snapshot so legs on the same asset are always byte-identical.
+/// Discriminant chosen to be distinct from all existing Custom codes used by the
+/// wrapper (up through Custom(41) as of v16-lp-vault-complete).
+pub const ERR_INCONSISTENT_LEG_ORACLE_PRICE: u32 = 8001;
+
 /// Matcher return structure written to context account at offset 0
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
