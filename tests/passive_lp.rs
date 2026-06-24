@@ -474,3 +474,51 @@ fn max_oracle_price_buy_no_panic() {
         assert_eq!(r.exec.size, 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// #14 regression: inventory-limit partial clip (not wholesale reject)
+// ---------------------------------------------------------------------------
+
+/// User requests 5, LP is short 9 against a limit of 10.
+/// Headroom = 10 - 9 = 1.  Result must be a partial fill of 1, not a reject.
+#[test]
+fn inventory_limit_partial_fill_buy() {
+    let cfg = PassiveMatcherConfig {
+        max_abs_inventory: 10,
+        ..default_cfg()
+    };
+    let mut lp = PassiveLpState { inventory_base: -9 };
+    let r = matcher().execute_match(&cfg, &mut lp, 100_000, 5, None);
+    assert_eq!(r.reason, Reason::Ok, "partial fill expected, got {:?}", r.reason);
+    assert_eq!(r.exec.size, 1, "fill must be clipped to headroom=1");
+    assert_eq!(lp.inventory_base, -10, "inventory at limit after fill");
+}
+
+/// User requests 5, LP is long 9 against a limit of 10.
+/// Headroom = 10 - 9 = 1.  Sell side: result must be a partial fill of 1.
+#[test]
+fn inventory_limit_partial_fill_sell() {
+    let cfg = PassiveMatcherConfig {
+        max_abs_inventory: 10,
+        ..default_cfg()
+    };
+    let mut lp = PassiveLpState { inventory_base: 9 };
+    let r = matcher().execute_match(&cfg, &mut lp, 100_000, -5, None);
+    assert_eq!(r.reason, Reason::Ok, "partial fill expected, got {:?}", r.reason);
+    assert_eq!(r.exec.size, -1, "fill must be clipped to headroom=1");
+    assert_eq!(lp.inventory_base, 10, "inventory at limit after fill");
+}
+
+/// LP is exactly at its short limit — zero headroom, must return LpInventoryLimit.
+#[test]
+fn inventory_limit_at_limit_buy_is_full_reject() {
+    let cfg = PassiveMatcherConfig {
+        max_abs_inventory: 10,
+        ..default_cfg()
+    };
+    let mut lp = PassiveLpState { inventory_base: -10 };
+    let r = matcher().execute_match(&cfg, &mut lp, 100_000, 1, None);
+    assert_eq!(r.reason, Reason::LpInventoryLimit);
+    assert_eq!(r.exec.size, 0);
+    assert_eq!(lp.inventory_base, -10); // unchanged
+}

@@ -92,13 +92,17 @@ pub struct Quote {
     pub ask: u64,
 }
 
-/// Ceiling division for u128: ceil(n / d)
+/// Ceiling division for u128: ceil(n / d).
+/// Returns None on zero divisor rather than silently returning 0.
+/// All call sites use a constant denominator (BPS_DENOM = 10_000) so this
+/// branch is only reachable if BPS_DENOM is somehow zero (compile-time const
+/// guard below ensures it never is at the one call site in compute_quote).
 #[inline]
-const fn ceil_div_u128(n: u128, d: u128) -> u128 {
+const fn ceil_div_u128(n: u128, d: u128) -> Option<u128> {
     if d == 0 {
-        return 0; // Caller must check oracle != 0 before calling
+        return None;
     }
-    n.div_ceil(d)
+    Some(n.div_ceil(d))
 }
 
 /// Compute bid/ask quotes from oracle price
@@ -122,7 +126,7 @@ pub fn compute_quote(cfg: &PassiveMatcherConfig, oracle_price: u64) -> Option<Qu
 
     // ask = ceil(oracle * (10000 + edge) / 10000)
     let ask_numer = oracle.checked_mul(BPS_DENOM.checked_add(edge)?)?;
-    let ask = ceil_div_u128(ask_numer, BPS_DENOM);
+    let ask = ceil_div_u128(ask_numer, BPS_DENOM)?;
 
     // Convert back to u64, should never overflow for reasonable prices
     let bid_u64 = if bid > u64::MAX as u128 {
@@ -207,7 +211,7 @@ impl PassiveOracleBpsMatcher {
         }
 
         // Apply size cap
-        let capped_abs_size = if abs_req_size > cfg.max_base_qty as u128 {
+        let mut capped_abs_size = if abs_req_size > cfg.max_base_qty as u128 {
             cfg.max_base_qty as u128
         } else {
             abs_req_size
@@ -215,6 +219,56 @@ impl PassiveOracleBpsMatcher {
 
         if capped_abs_size == 0 {
             return MatchResult::unfilled(Reason::LpMaxSize);
+        }
+
+        // Check inventory limit: clip to remaining headroom rather than
+        // rejecting the whole fill (mirrors vamm.rs check_inventory_limit).
+        // This gives partial fills when the LP has some — but not enough —
+        // inventory headroom.
+        {
+            let max_inv_abs = cfg.max_abs_inventory.unsigned_abs();
+            let current_inv = lp.inventory_base;
+            // LP inventory moves opposite to user trade direction:
+            // user buys  => LP sells => LP inventory decreases (negative delta)
+            // user sells => LP buys  => LP inventory increases (positive delta)
+            let lp_delta = if is_user_buy {
+                -(capped_abs_size as i128)
+            } else {
+                capped_abs_size as i128
+            };
+            let new_inventory = match current_inv.checked_add(lp_delta) {
+                Some(inv) => inv,
+                None => return MatchResult::unfilled(Reason::MathOverflow),
+            };
+            if new_inventory.unsigned_abs() > max_inv_abs {
+                // Compute the largest fill that stays within the limit.
+                let max_fill = if is_user_buy {
+                    // LP is selling (inventory goes negative). Headroom = max_inv - |current|
+                    // if LP is already short beyond the limit, headroom = 0.
+                    if current_inv <= -(max_inv_abs as i128) {
+                        0u128
+                    } else {
+                        match current_inv.checked_add(max_inv_abs as i128) {
+                            Some(val) => val.unsigned_abs(),
+                            None => return MatchResult::unfilled(Reason::MathOverflow),
+                        }
+                    }
+                } else {
+                    // LP is buying (inventory goes positive). Headroom = max_inv - current.
+                    if current_inv >= max_inv_abs as i128 {
+                        0u128
+                    } else {
+                        match (max_inv_abs as i128).checked_sub(current_inv) {
+                            Some(val) => val.unsigned_abs(),
+                            None => return MatchResult::unfilled(Reason::MathOverflow),
+                        }
+                    }
+                };
+                capped_abs_size = capped_abs_size.min(max_fill);
+                if capped_abs_size == 0 {
+                    return MatchResult::unfilled(Reason::LpInventoryLimit);
+                }
+            }
         }
 
         // Convert to i128 for inventory math
@@ -230,12 +284,14 @@ impl PassiveOracleBpsMatcher {
         // User sells (negative) => LP buys => LP inventory increases (more long)
         let lp_inventory_delta = -fill_size;
 
-        // Check inventory limit
+        // Recompute new_inventory post-clip for the state update below.
         let new_inventory = match lp.inventory_base.checked_add(lp_inventory_delta) {
             Some(inv) => inv,
             None => return MatchResult::unfilled(Reason::MathOverflow),
         };
 
+        // Invariant: the clip above guarantees this never fires for reasonable
+        // inputs. Keep as a hard guard against logic errors.
         if new_inventory.unsigned_abs() > cfg.max_abs_inventory.unsigned_abs() {
             return MatchResult::unfilled(Reason::LpInventoryLimit);
         }
