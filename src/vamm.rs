@@ -246,7 +246,7 @@ impl MatcherCtx {
 
     pub fn validate(&self) -> Result<(), ProgramError> {
         // 3E.1: Reject stale or mis-versioned accounts before processing.
-        if self.version != MATCHER_VERSION {
+        if self.version != MATCHER_VERSION && self.version != 3 {
             return Err(ProgramError::InvalidAccountData);
         }
         let kind = self.get_kind()?;
@@ -481,17 +481,15 @@ pub fn process_call(
     };
     ctx.validate()?;
 
+    if ctx.version == 3 {
+        ctx.version = MATCHER_VERSION;
+    }
+
     if lp_pda.key.to_bytes() != ctx.lp_pda {
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // 3E.2 (v3-compat): Validate caller-supplied lp_account_id against the stored
-    // ctx value ONLY when ctx.lp_account_id was explicitly set at init (non-zero).
-    // v16's 66-byte upstream init payload leaves lp_account_id = 0, in which case
-    // the v16 protocol relies on the lp_pda signer chain (PM-3) for authentication
-    // and the 3E.2 belt-and-braces check is skipped. Fork-extended 78-byte init
-    // (legacy flow) still enforces the original 3E.2 hardening.
-    if ctx.lp_account_id != 0 && call.lp_account_id != ctx.lp_account_id {
+    if call.lp_account_id != ctx.lp_account_id {
         return Err(ProgramError::InvalidInstructionData);
     }
 
@@ -568,12 +566,22 @@ pub fn process_batch_call(
         MatcherCtx::read_from(&data[CTX_VAMM_OFFSET..])?
     };
     ctx.validate()?;
+
+    if ctx.version == 3 {
+        ctx.version = MATCHER_VERSION;
+    }
+
     if lp_pda.key.to_bytes() != ctx.lp_pda {
         return Err(ProgramError::InvalidAccountData);
     }
 
+    if lp_account_id != ctx.lp_account_id {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
     let mut returns = [0u8; MATCHER_BATCH_MAX_LEGS * MATCHER_RETURN_LEN];
     for i in 0..n {
+        ctx.insurance_fee_remainder_e6 = 0;
         let base = MATCHER_BATCH_HEADER_LEN + i * MATCHER_BATCH_LEG_LEN;
         let asset_index =
             u16::from_le_bytes(instruction_data[base..base + 2].try_into().unwrap());
@@ -913,6 +921,7 @@ pub const INIT_VAMM_LEN: usize = INIT_CTX_LEN;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{MATCHER_CALL_LEN, MATCHER_CALL_TAG};
 
     fn default_vamm_ctx() -> MatcherCtx {
         MatcherCtx {
@@ -1378,10 +1387,15 @@ mod tests {
     #[test]
     fn test_validation_rejects_wrong_version() {
         let mut ctx = default_vamm_ctx();
-        ctx.version = MATCHER_VERSION - 1;
+        ctx.version = 2;
         assert!(
             ctx.validate().is_err(),
-            "validate() must reject version != MATCHER_VERSION"
+            "validate() must reject version != 3 and != 4"
+        );
+        ctx.version = 5;
+        assert!(
+            ctx.validate().is_err(),
+            "validate() must reject version != 3 and != 4"
         );
     }
 
@@ -1416,6 +1430,78 @@ mod tests {
             "validate() must accept max_inventory_abs == 0 in v3 (treated as unlimited)"
         );
     }
+
+    #[test]
+    fn test_v3_to_v4_auto_migration() {
+        let mut ctx = default_vamm_ctx();
+        ctx.version = 3;
+        assert!(ctx.validate().is_ok());
+
+        let program_id = Pubkey::new_unique();
+        let ctx_key = Pubkey::new_unique();
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let mut ctx_data = [0u8; MATCHER_CONTEXT_LEN];
+
+        // Initialize as v3 account
+        let mut v3_ctx = ctx;
+        v3_ctx.version = 3;
+        v3_ctx.write_to(&mut ctx_data[CTX_VAMM_OFFSET..]).unwrap();
+
+        // Check validation
+        let read_ctx = MatcherCtx::read_from(&ctx_data[CTX_VAMM_OFFSET..]).unwrap();
+        assert_eq!(read_ctx.version, 3);
+
+        // Call process_call with a dummy call
+        let call = MatcherCall {
+            req_id: 1,
+            asset_index: 0,
+            lp_account_id: ctx.lp_account_id,
+            oracle_price_e6: 100_000_000,
+            req_size: 100,
+        };
+        let mut call_data = [0u8; MATCHER_CALL_LEN];
+        call_data[0] = MATCHER_CALL_TAG;
+        call_data[1..9].copy_from_slice(&call.req_id.to_le_bytes());
+        call_data[9..11].copy_from_slice(&call.asset_index.to_le_bytes());
+        call_data[11..19].copy_from_slice(&call.lp_account_id.to_le_bytes());
+        call_data[19..27].copy_from_slice(&call.oracle_price_e6.to_le_bytes());
+        call_data[27..43].copy_from_slice(&call.req_size.to_le_bytes());
+
+        // Set lp_pda key to match ctx.lp_pda
+        let lp_pda_pubkey = Pubkey::new_from_array(ctx.lp_pda);
+        let accounts = [
+            AccountInfo::new(
+                &lp_pda_pubkey,
+                true,
+                false,
+                &mut lp_lamports,
+                &mut [],
+                &program_id,
+                false,
+                0,
+            ),
+            AccountInfo::new(
+                &ctx_key,
+                false,
+                true,
+                &mut ctx_lamports,
+                &mut ctx_data,
+                &program_id,
+                false,
+                0,
+            ),
+        ];
+
+        // Call the processor
+        let result = crate::process_instruction(&program_id, &accounts, &call_data);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+
+        // Verify version was upgraded to 4
+        let upgraded_ctx = MatcherCtx::read_from(&ctx_data[CTX_VAMM_OFFSET..]).unwrap();
+        assert_eq!(upgraded_ctx.version, 4);
+    }
+
 
     #[test]
     fn test_validation_accepts_nonzero_max_inventory_abs() {

@@ -474,3 +474,22 @@ fn max_oracle_price_buy_no_panic() {
         assert_eq!(r.exec.size, 0);
     }
 }
+
+#[test]
+fn inventory_limit_partial_fill_clip() {
+    let cfg = PassiveMatcherConfig {
+        max_abs_inventory: 10,
+        ..default_cfg()
+    };
+    let mut lp = PassiveLpState {
+        inventory_base: -9, // LP is short 9 (close to short limit of -10)
+    };
+    // User buys 5 (LP would sell 5, which would push inventory to -14)
+    // Headroom = 10 - 9 = 1.
+    // So the request should be clipped to 1 instead of fully rejected!
+    let r = matcher().execute_match(&cfg, &mut lp, 100_000, 5, None);
+    assert_eq!(r.reason, Reason::Ok);
+    assert_eq!(r.exec.size, 1);
+    assert_eq!(lp.inventory_base, -10); // Now at max limit
+}
+

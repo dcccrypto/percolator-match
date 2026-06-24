@@ -94,11 +94,11 @@ pub struct Quote {
 
 /// Ceiling division for u128: ceil(n / d)
 #[inline]
-const fn ceil_div_u128(n: u128, d: u128) -> u128 {
+const fn ceil_div_u128(n: u128, d: u128) -> Option<u128> {
     if d == 0 {
-        return 0; // Caller must check oracle != 0 before calling
+        return None;
     }
-    n.div_ceil(d)
+    Some(n.div_ceil(d))
 }
 
 /// Compute bid/ask quotes from oracle price
@@ -122,7 +122,7 @@ pub fn compute_quote(cfg: &PassiveMatcherConfig, oracle_price: u64) -> Option<Qu
 
     // ask = ceil(oracle * (10000 + edge) / 10000)
     let ask_numer = oracle.checked_mul(BPS_DENOM.checked_add(edge)?)?;
-    let ask = ceil_div_u128(ask_numer, BPS_DENOM);
+    let ask = ceil_div_u128(ask_numer, BPS_DENOM)?;
 
     // Convert back to u64, should never overflow for reasonable prices
     let bid_u64 = if bid > u64::MAX as u128 {
@@ -207,7 +207,7 @@ impl PassiveOracleBpsMatcher {
         }
 
         // Apply size cap
-        let capped_abs_size = if abs_req_size > cfg.max_base_qty as u128 {
+        let mut capped_abs_size = if abs_req_size > cfg.max_base_qty as u128 {
             cfg.max_base_qty as u128
         } else {
             abs_req_size
@@ -215,6 +215,46 @@ impl PassiveOracleBpsMatcher {
 
         if capped_abs_size == 0 {
             return MatchResult::unfilled(Reason::LpMaxSize);
+        }
+
+        // Check inventory limit and clip if necessary
+        let max_inv_abs = cfg.max_abs_inventory.unsigned_abs();
+        let current_inv = lp.inventory_base;
+        let lp_inventory_delta = if is_user_buy {
+            -(capped_abs_size as i128)
+        } else {
+            capped_abs_size as i128
+        };
+        let new_inventory = match current_inv.checked_add(lp_inventory_delta) {
+            Some(inv) => inv,
+            None => return MatchResult::unfilled(Reason::MathOverflow),
+        };
+
+        if new_inventory.unsigned_abs() > max_inv_abs {
+            let max_fill = if is_user_buy {
+                if current_inv <= -(max_inv_abs as i128) {
+                    0
+                } else {
+                    match current_inv.checked_add(max_inv_abs as i128) {
+                        Some(val) => val.unsigned_abs(),
+                        None => return MatchResult::unfilled(Reason::MathOverflow),
+                    }
+                }
+            } else {
+                if current_inv >= max_inv_abs as i128 {
+                    0
+                } else {
+                    match (max_inv_abs as i128).checked_sub(current_inv) {
+                        Some(val) => val.unsigned_abs(),
+                        None => return MatchResult::unfilled(Reason::MathOverflow),
+                    }
+                }
+            };
+
+            capped_abs_size = capped_abs_size.min(max_fill);
+            if capped_abs_size == 0 {
+                return MatchResult::unfilled(Reason::LpInventoryLimit);
+            }
         }
 
         // Convert to i128 for inventory math
@@ -236,7 +276,7 @@ impl PassiveOracleBpsMatcher {
             None => return MatchResult::unfilled(Reason::MathOverflow),
         };
 
-        if new_inventory.unsigned_abs() > cfg.max_abs_inventory.unsigned_abs() {
+        if new_inventory.unsigned_abs() > max_inv_abs {
             return MatchResult::unfilled(Reason::LpInventoryLimit);
         }
 

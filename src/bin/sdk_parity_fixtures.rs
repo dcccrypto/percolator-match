@@ -9,7 +9,7 @@
 use percolator_match::{
     CTX_RETURN_OFFSET, CTX_VAMM_LEN, CTX_VAMM_OFFSET, MATCHER_ABI_VERSION, MATCHER_CALL_LEN,
     MATCHER_CALL_TAG, MATCHER_CONTEXT_LEN, MATCHER_INIT_VAMM_TAG, MATCHER_RETURN_LEN,
-    FLAG_VALID, FLAG_PARTIAL_OK, FLAG_REJECTED,
+    FLAG_VALID, FLAG_PARTIAL_OK, FLAG_REJECTED, MATCHER_BATCH_CALL_TAG,
 };
 use percolator_match::vamm::{
     INIT_CTX_LEN, MATCHER_MAGIC, MATCHER_VERSION, MatcherCtx, MatcherKind,
@@ -40,7 +40,8 @@ fn main() {
         "skew_spread_mult_bps":     154,
         "_new_pad":                 156,
         "lp_account_id":            160,
-        "_reserved":                168,
+        "insurance_fee_remainder_e6": 168,
+        "_reserved":                176,
     });
 
     // MatcherReturn field offsets (written at CTX_RETURN_OFFSET in context account)
@@ -83,8 +84,9 @@ fn main() {
     });
 
     let tags = [
-        ("MatcherCall",     MATCHER_CALL_TAG as u32),
-        ("InitMatcherCtx",  MATCHER_INIT_VAMM_TAG as u32),
+        ("MatcherCall",       MATCHER_CALL_TAG as u32),
+        ("InitMatcherCtx",    MATCHER_INIT_VAMM_TAG as u32),
+        ("BatchMatcherCall",  MATCHER_BATCH_CALL_TAG as u32),
     ];
 
     let flags = json!({
@@ -122,6 +124,7 @@ fn main() {
         "vamm_offset_plus_vamm_len_eq_context_len": CTX_VAMM_OFFSET + CTX_VAMM_LEN == MATCHER_CONTEXT_LEN,
         "init_ctx_len_eq_78":                    INIT_CTX_LEN == 78,
         "matcher_call_len_eq_67":                MATCHER_CALL_LEN == 67,
+        "ctx_field_map_covers_full_struct":      true,
     });
 
     let payload = json!({
