@@ -11,7 +11,7 @@ use solana_program::{
 };
 
 use crate::{
-    ERR_INCONSISTENT_LEG_ORACLE_PRICE, MatcherCall, MatcherReturn, CTX_VAMM_LEN, CTX_VAMM_OFFSET,
+    MatcherCall, MatcherReturn, CTX_VAMM_LEN, CTX_VAMM_OFFSET, ERR_INCONSISTENT_LEG_ORACLE_PRICE,
     FLAG_PARTIAL_OK, FLAG_VALID, MATCHER_ABI_VERSION, MATCHER_BATCH_HEADER_LEN,
     MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS, MATCHER_CONTEXT_LEN, MATCHER_RETURN_LEN,
     ORACLE_PRICE_E6_MAX,
@@ -507,7 +507,9 @@ pub fn process_call(
 
     if exec_size != 0 {
         // 3E.3: Use checked_sub to surface underflow rather than silently saturating.
-        ctx.inventory_base = ctx.inventory_base.checked_sub(exec_size)
+        ctx.inventory_base = ctx
+            .inventory_base
+            .checked_sub(exec_size)
             .ok_or(ProgramError::ArithmeticOverflow)?;
         ctx.last_oracle_price_e6 = call.oracle_price_e6;
         ctx.last_exec_price_e6 = exec_price;
@@ -657,8 +659,7 @@ pub fn process_batch_call(
         // start clean for each leg.
         ctx.insurance_fee_remainder_e6 = 0;
         let base = MATCHER_BATCH_HEADER_LEN + i * MATCHER_BATCH_LEG_LEN;
-        let asset_index =
-            u16::from_le_bytes(instruction_data[base..base + 2].try_into().unwrap());
+        let asset_index = u16::from_le_bytes(instruction_data[base..base + 2].try_into().unwrap());
         let oracle_price_e6 =
             u64::from_le_bytes(instruction_data[base + 2..base + 10].try_into().unwrap());
         let req_size =
@@ -687,8 +688,7 @@ pub fn process_batch_call(
 
             // Accrue insurance fee per-leg, same as single-fill path.
             if ctx.fee_to_insurance_bps > 0 {
-                let (insurance_fee, remainder) =
-                    compute_insurance_fee(&ctx, exec_size, exec_price);
+                let (insurance_fee, remainder) = compute_insurance_fee(&ctx, exec_size, exec_price);
                 ctx.insurance_accrued_e6 = ctx
                     .insurance_accrued_e6
                     .checked_add(insurance_fee)
@@ -1432,7 +1432,10 @@ mod tests {
         let exec_price = 100_000_000u64;
 
         let (fee_unsplit, _) = compute_insurance_fee(&ctx, 1000, exec_price);
-        assert!(fee_unsplit > 0, "sanity: unsplit fill should accrue a nonzero fee");
+        assert!(
+            fee_unsplit > 0,
+            "sanity: unsplit fill should accrue a nonzero fee"
+        );
 
         let mut split_ctx = ctx;
         let mut total_split_fee: u64 = 0;
@@ -1553,7 +1556,10 @@ mod tests {
             expected_ceil > expected_floor,
             "test setup: remainder must be non-zero for this to be meaningful"
         );
-        assert_eq!(exec_price as u128, expected_ceil, "buy side must use ceiling div");
+        assert_eq!(
+            exec_price as u128, expected_ceil,
+            "buy side must use ceiling div"
+        );
     }
 
     /// Verify that compute_passive_execution floor-divides on sell.
@@ -1568,14 +1574,17 @@ mod tests {
         let total_bps: u128 = 55;
         let oracle: u128 = 100_000_001;
         let expected_floor = oracle * (BPS_DENOM - total_bps) / BPS_DENOM;
-        assert_eq!(exec_price as u128, expected_floor, "sell side must use floor div");
+        assert_eq!(
+            exec_price as u128, expected_floor,
+            "sell side must use floor div"
+        );
     }
 
     /// Same ceiling division test for vAMM path.
     #[test]
     fn test_vamm_buy_ceiling_div_rounds_up() {
         let ctx = default_vamm_ctx(); // base_spread=10, fee=5, impact_k=100, liq=1e12
-        // Use req_size=1 so impact is negligible and total_bps is just base+fee = 15
+                                      // Use req_size=1 so impact is negligible and total_bps is just base+fee = 15
         let call = make_call(100_000_001, 1);
         let (exec_price, exec_size, flags) = compute_execution(&ctx, &call).unwrap();
         assert_eq!(exec_size, 1);
@@ -1644,8 +1653,7 @@ mod tests {
         ctx.inventory_base = 0;
         // Large buy request — fill should be capped at min(req, max_inv) = max_inv
         ctx.max_fill_abs = i128::MAX as u128;
-        let fill_abs_result =
-            check_inventory_limit(&ctx, i128::MAX as u128, true);
+        let fill_abs_result = check_inventory_limit(&ctx, i128::MAX as u128, true);
         assert!(
             fill_abs_result.is_ok(),
             "check_inventory_limit must not error at i128::MAX boundary"
@@ -1693,9 +1701,15 @@ mod tests {
         };
         let (_p2, exec2, _f2) = compute_execution(&ctx, &call2).unwrap();
         // inventory 300, max 500 → headroom = 500-300 = 200. Fill capped at 200.
-        assert_eq!(exec2, -200, "leg 2: fill capped at remaining 200 inventory headroom");
+        assert_eq!(
+            exec2, -200,
+            "leg 2: fill capped at remaining 200 inventory headroom"
+        );
         ctx.inventory_base = ctx.inventory_base.checked_sub(exec2).unwrap();
-        assert_eq!(ctx.inventory_base, 500, "after leg 2 inventory=500 (at max)");
+        assert_eq!(
+            ctx.inventory_base, 500,
+            "after leg 2 inventory=500 (at max)"
+        );
     }
 
     /// Batch: checked_sub raises ArithmeticOverflow if inventory would overflow i128.
@@ -1737,7 +1751,10 @@ mod tests {
             oracle_price_e6: call.oracle_price_e6,
             asset_index: call.asset_index as u64,
         };
-        assert_eq!(ret.lp_account_id, 0xDEAD_CAFE, "lp_account_id must be echoed per-leg");
+        assert_eq!(
+            ret.lp_account_id, 0xDEAD_CAFE,
+            "lp_account_id must be echoed per-leg"
+        );
         assert_eq!(ret.asset_index, 7u64, "asset_index must be echoed per-leg");
         assert_eq!(ret.req_id, 42, "req_id must be echoed per-leg");
     }
@@ -1745,14 +1762,20 @@ mod tests {
     /// Batch wire: MATCHER_BATCH_HEADER_LEN + 1*MATCHER_BATCH_LEG_LEN = 44 bytes for n=1.
     #[test]
     fn test_batch_wire_sizes() {
-        use crate::{MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS, MATCHER_RETURN_LEN};
+        use crate::{
+            MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS,
+            MATCHER_RETURN_LEN,
+        };
         assert_eq!(MATCHER_BATCH_HEADER_LEN, 18);
         assert_eq!(MATCHER_BATCH_LEG_LEN, 26);
         assert_eq!(MATCHER_BATCH_MAX_LEGS, 16);
         // N=1 payload: 18+26 = 44 bytes
         assert_eq!(MATCHER_BATCH_HEADER_LEN + MATCHER_BATCH_LEG_LEN, 44);
         // Max payload: 18 + 16*26 = 434 bytes
-        assert_eq!(MATCHER_BATCH_HEADER_LEN + MATCHER_BATCH_MAX_LEGS * MATCHER_BATCH_LEG_LEN, 434);
+        assert_eq!(
+            MATCHER_BATCH_HEADER_LEN + MATCHER_BATCH_MAX_LEGS * MATCHER_BATCH_LEG_LEN,
+            434
+        );
         // Max return data: 16 * 64 = 1024 bytes (fits Solana return-data cap)
         assert_eq!(MATCHER_BATCH_MAX_LEGS * MATCHER_RETURN_LEN, 1024);
     }
@@ -1792,7 +1815,10 @@ mod tests {
     /// does.
     #[test]
     fn test_batch_inconsistent_oracle_prices_same_asset_rejected() {
-        use crate::{ERR_INCONSISTENT_LEG_ORACLE_PRICE, MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS, ORACLE_PRICE_E6_MAX};
+        use crate::{
+            ERR_INCONSISTENT_LEG_ORACLE_PRICE, MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN,
+            MATCHER_BATCH_MAX_LEGS, ORACLE_PRICE_E6_MAX,
+        };
 
         // Build a 2-leg payload: both legs target asset_index=0 but with
         // different prices (100_000_000 vs 200_000_000).
@@ -1846,13 +1872,16 @@ mod tests {
     /// IDENTICAL oracle_price_e6 values must pass the consistency check.
     #[test]
     fn test_batch_consistent_oracle_prices_same_asset_accepted() {
-        use crate::{MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS, ORACLE_PRICE_E6_MAX};
+        use crate::{
+            MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS,
+            ORACLE_PRICE_E6_MAX,
+        };
 
         // Two legs on asset 0 at the same price, plus a leg on asset 1.
         let legs: [(u16, u64, i128); 3] = [
-            (0, 100_000_000, 100),   // asset 0, price A
-            (1, 50_000_000, 200),    // asset 1, price C
-            (0, 100_000_000, -50),   // asset 0, price A again — identical, OK
+            (0, 100_000_000, 100), // asset 0, price A
+            (1, 50_000_000, 200),  // asset 1, price C
+            (0, 100_000_000, -50), // asset 0, price A again — identical, OK
         ];
         let payload = build_batch_payload(&legs);
 
@@ -1970,7 +1999,10 @@ mod tests {
             // astronomically large but the guard is inclusive-at-ceiling).
             Ok(())
         };
-        assert!(result.is_ok(), "price at ceiling must be accepted by the guard");
+        assert!(
+            result.is_ok(),
+            "price at ceiling must be accepted by the guard"
+        );
     }
 
     /// #8-hardening (batch upper-bound): A batch leg with oracle_price_e6 above
@@ -2021,17 +2053,16 @@ mod tests {
             let mut buf = alloc::vec![0u8; MATCHER_BATCH_HEADER_LEN + MATCHER_BATCH_LEG_LEN];
             buf[0] = crate::MATCHER_BATCH_CALL_TAG;
             buf[1] = 1u8;
-            buf[2..10].copy_from_slice(&1u64.to_le_bytes());  // req_id
+            buf[2..10].copy_from_slice(&1u64.to_le_bytes()); // req_id
             buf[10..18].copy_from_slice(&999u64.to_le_bytes()); // lp_account_id = 999
-            // one leg with valid data
+                                                                // one leg with valid data
             buf[18..20].copy_from_slice(&0u16.to_le_bytes()); // asset_index
             buf[20..28].copy_from_slice(&100_000_000u64.to_le_bytes()); // oracle
             buf[28..44].copy_from_slice(&100i128.to_le_bytes()); // req_size
             buf
         };
 
-        let lp_account_id_from_payload =
-            u64::from_le_bytes(payload[10..18].try_into().unwrap());
+        let lp_account_id_from_payload = u64::from_le_bytes(payload[10..18].try_into().unwrap());
 
         // Guard: same logic as process_batch_call
         let result: Result<(), ProgramError> =
@@ -2061,7 +2092,10 @@ mod tests {
                 Ok(())
             };
 
-        assert!(result.is_ok(), "#12: matching lp_account_id must pass guard");
+        assert!(
+            result.is_ok(),
+            "#12: matching lp_account_id must pass guard"
+        );
     }
 
     /// #12 v3-compat: when ctx.lp_account_id = 0, any payload value passes.
@@ -2078,7 +2112,10 @@ mod tests {
                 Ok(())
             };
 
-        assert!(result.is_ok(), "#12 v3-compat: zero ctx.lp_account_id must skip guard");
+        assert!(
+            result.is_ok(),
+            "#12 v3-compat: zero ctx.lp_account_id must skip guard"
+        );
     }
 
     // ==========================================================================
@@ -2095,8 +2132,8 @@ mod tests {
     fn test_batch_per_leg_remainder_reset() {
         // ctx with insurance enabled
         let mut ctx = default_vamm_ctx();
-        ctx.fee_to_insurance_bps = 500;  // 5% of trading fee
-        ctx.trading_fee_bps = 10;        // 10 bps trading fee
+        ctx.fee_to_insurance_bps = 500; // 5% of trading fee
+        ctx.trading_fee_bps = 10; // 10 bps trading fee
         ctx.insurance_fee_remainder_e6 = 12345; // non-zero remainder from previous state
 
         let exec_size: i128 = 1_000_000;
@@ -2118,7 +2155,10 @@ mod tests {
         let (fee2_without_reset, _) = compute_insurance_fee(&ctx, exec_size, exec_price);
 
         // With reset: both legs yield the same fee (deterministic, remainder = 0 each time)
-        assert_eq!(fee1_with_reset, fee2_with_reset, "with reset: symmetric legs must yield equal fees");
+        assert_eq!(
+            fee1_with_reset, fee2_with_reset,
+            "with reset: symmetric legs must yield equal fees"
+        );
 
         // Without reset: leg2 may differ from leg1 due to inherited remainder
         // This is the latent bug. We don't assert it differs (could be same by coincidence),
@@ -2183,7 +2223,10 @@ mod tests {
     #[test]
     fn test_sdk_fixture_batch_call_tag_is_3() {
         use crate::MATCHER_BATCH_CALL_TAG;
-        assert_eq!(MATCHER_BATCH_CALL_TAG, 3u8, "#16: MATCHER_BATCH_CALL_TAG must be 3");
+        assert_eq!(
+            MATCHER_BATCH_CALL_TAG, 3u8,
+            "#16: MATCHER_BATCH_CALL_TAG must be 3"
+        );
     }
 }
 
@@ -2337,9 +2380,10 @@ mod proofs {
         // Un-staged trading fee reference, consistent with the single fused
         // division compute_insurance_fee now performs (no intermediate floor).
         let abs_size = exec_size.unsigned_abs();
-        let full_trading_fee =
-            abs_size.saturating_mul(exec_price as u128).saturating_mul(trading_fee_bps as u128)
-                / 10_000_000_000u128;
+        let full_trading_fee = abs_size
+            .saturating_mul(exec_price as u128)
+            .saturating_mul(trading_fee_bps as u128)
+            / 10_000_000_000u128;
 
         // PROPERTY: insurance fee ≤ full trading fee + 2 (one unit for dropping the
         // intermediate notional floor, one unit for the carried remainder).

@@ -4,8 +4,8 @@
 //! and the NEW-3 signer inversion regression (buy→huge sell direction bug).
 
 use percolator_match::passive_lp_matcher::{
-    compute_quote, MatchResult, PassiveLpState, PassiveMatcherConfig,
-    PassiveOracleBpsMatcher, Reason,
+    compute_quote, MatchResult, PassiveLpState, PassiveMatcherConfig, PassiveOracleBpsMatcher,
+    Reason,
 };
 
 // ---------------------------------------------------------------------------
@@ -38,7 +38,11 @@ fn new3_buy_req_produces_positive_exec_size() {
     let mut lp = default_lp();
     let r = matcher().execute_match(&default_cfg(), &mut lp, 100_000, 1, None);
     assert_eq!(r.reason, Reason::Ok);
-    assert!(r.exec.size > 0, "NEW-3: buy req must produce positive exec size, got {}", r.exec.size);
+    assert!(
+        r.exec.size > 0,
+        "NEW-3: buy req must produce positive exec size, got {}",
+        r.exec.size
+    );
 }
 
 #[test]
@@ -46,7 +50,11 @@ fn new3_sell_req_produces_negative_exec_size() {
     let mut lp = default_lp();
     let r = matcher().execute_match(&default_cfg(), &mut lp, 100_000, -1, None);
     assert_eq!(r.reason, Reason::Ok);
-    assert!(r.exec.size < 0, "NEW-3: sell req must produce negative exec size, got {}", r.exec.size);
+    assert!(
+        r.exec.size < 0,
+        "NEW-3: sell req must produce negative exec size, got {}",
+        r.exec.size
+    );
 }
 
 #[test]
@@ -266,7 +274,10 @@ fn zero_qty_rejected() {
 
 #[test]
 fn below_min_base_qty_rejected() {
-    let cfg = PassiveMatcherConfig { min_base_qty: 10, ..default_cfg() };
+    let cfg = PassiveMatcherConfig {
+        min_base_qty: 10,
+        ..default_cfg()
+    };
     let mut lp = default_lp();
     let r = matcher().execute_match(&cfg, &mut lp, 100_000, 5, None);
     assert_eq!(r.reason, Reason::ZeroQty);
@@ -276,7 +287,10 @@ fn below_min_base_qty_rejected() {
 
 #[test]
 fn at_min_base_qty_succeeds() {
-    let cfg = PassiveMatcherConfig { min_base_qty: 10, ..default_cfg() };
+    let cfg = PassiveMatcherConfig {
+        min_base_qty: 10,
+        ..default_cfg()
+    };
     let mut lp = default_lp();
     let r = matcher().execute_match(&cfg, &mut lp, 100_000, 10, None);
     assert_eq!(r.reason, Reason::Ok);
@@ -299,7 +313,10 @@ fn zero_oracle_rejected() {
 
 #[test]
 fn buy_capped_at_max_base_qty() {
-    let cfg = PassiveMatcherConfig { max_base_qty: 5, ..default_cfg() };
+    let cfg = PassiveMatcherConfig {
+        max_base_qty: 5,
+        ..default_cfg()
+    };
     let mut lp = default_lp();
     let r = matcher().execute_match(&cfg, &mut lp, 100_000, 1000, None);
     assert_eq!(r.reason, Reason::Ok);
@@ -309,7 +326,10 @@ fn buy_capped_at_max_base_qty() {
 
 #[test]
 fn sell_capped_at_max_base_qty() {
-    let cfg = PassiveMatcherConfig { max_base_qty: 5, ..default_cfg() };
+    let cfg = PassiveMatcherConfig {
+        max_base_qty: 5,
+        ..default_cfg()
+    };
     let mut lp = default_lp();
     let r = matcher().execute_match(&cfg, &mut lp, 100_000, -1000, None);
     assert_eq!(r.reason, Reason::Ok);
@@ -327,10 +347,15 @@ fn inventory_limit_buy_rejected_when_at_max() {
         max_abs_inventory: 10,
         ..default_cfg()
     };
-    let mut lp = PassiveLpState { inventory_base: -10 }; // LP already at short limit
+    let mut lp = PassiveLpState {
+        inventory_base: -10,
+    }; // LP already at short limit
     let r = matcher().execute_match(&cfg, &mut lp, 100_000, 1, None);
     assert_eq!(r.reason, Reason::LpInventoryLimit);
-    assert_eq!(lp.inventory_base, -10, "inventory must not change on rejection");
+    assert_eq!(
+        lp.inventory_base, -10,
+        "inventory must not change on rejection"
+    );
 }
 
 #[test]
@@ -342,7 +367,10 @@ fn inventory_limit_sell_rejected_when_at_max() {
     let mut lp = PassiveLpState { inventory_base: 10 }; // LP already at long limit
     let r = matcher().execute_match(&cfg, &mut lp, 100_000, -1, None);
     assert_eq!(r.reason, Reason::LpInventoryLimit);
-    assert_eq!(lp.inventory_base, 10, "inventory must not change on rejection");
+    assert_eq!(
+        lp.inventory_base, 10,
+        "inventory must not change on rejection"
+    );
 }
 
 #[test]
@@ -361,14 +389,17 @@ fn inventory_limit_buy_accepted_when_one_below_limit() {
 fn inventory_state_unchanged_on_any_rejection() {
     // Verify all rejection paths leave LP state immutable.
     let rejects: &[(i128, i128, Option<u64>)] = &[
-        (100_000, 0, None),           // zero qty
-        (0, 1, None),                 // oracle zero
-        (100_000, 1, Some(0)),        // limit too tight
+        (100_000, 0, None),    // zero qty
+        (0, 1, None),          // oracle zero
+        (100_000, 1, Some(0)), // limit too tight
     ];
     for (oracle, size, limit) in rejects {
         let mut lp = PassiveLpState { inventory_base: 42 };
         let _ = matcher().execute_match(&default_cfg(), &mut lp, *oracle as u64, *size, *limit);
-        assert_eq!(lp.inventory_base, 42, "inventory must not change on rejection");
+        assert_eq!(
+            lp.inventory_base, 42,
+            "inventory must not change on rejection"
+        );
     }
 }
 
@@ -489,7 +520,12 @@ fn inventory_limit_partial_fill_buy() {
     };
     let mut lp = PassiveLpState { inventory_base: -9 };
     let r = matcher().execute_match(&cfg, &mut lp, 100_000, 5, None);
-    assert_eq!(r.reason, Reason::Ok, "partial fill expected, got {:?}", r.reason);
+    assert_eq!(
+        r.reason,
+        Reason::Ok,
+        "partial fill expected, got {:?}",
+        r.reason
+    );
     assert_eq!(r.exec.size, 1, "fill must be clipped to headroom=1");
     assert_eq!(lp.inventory_base, -10, "inventory at limit after fill");
 }
@@ -504,7 +540,12 @@ fn inventory_limit_partial_fill_sell() {
     };
     let mut lp = PassiveLpState { inventory_base: 9 };
     let r = matcher().execute_match(&cfg, &mut lp, 100_000, -5, None);
-    assert_eq!(r.reason, Reason::Ok, "partial fill expected, got {:?}", r.reason);
+    assert_eq!(
+        r.reason,
+        Reason::Ok,
+        "partial fill expected, got {:?}",
+        r.reason
+    );
     assert_eq!(r.exec.size, -1, "fill must be clipped to headroom=1");
     assert_eq!(lp.inventory_base, 10, "inventory at limit after fill");
 }
@@ -516,7 +557,9 @@ fn inventory_limit_at_limit_buy_is_full_reject() {
         max_abs_inventory: 10,
         ..default_cfg()
     };
-    let mut lp = PassiveLpState { inventory_base: -10 };
+    let mut lp = PassiveLpState {
+        inventory_base: -10,
+    };
     let r = matcher().execute_match(&cfg, &mut lp, 100_000, 1, None);
     assert_eq!(r.reason, Reason::LpInventoryLimit);
     assert_eq!(r.exec.size, 0);

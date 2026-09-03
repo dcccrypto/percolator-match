@@ -6,14 +6,14 @@
 //!
 //! Mirrors the pattern in percolator-prog, percolator-stake, and percolator-nft.
 
-use percolator_match::{
-    CTX_RETURN_OFFSET, CTX_VAMM_LEN, CTX_VAMM_OFFSET, MATCHER_ABI_VERSION, MATCHER_CALL_LEN,
-    MATCHER_CALL_TAG, MATCHER_CONTEXT_LEN, MATCHER_INIT_VAMM_TAG, MATCHER_RETURN_LEN,
-    FLAG_VALID, FLAG_PARTIAL_OK, FLAG_REJECTED,
-    MATCHER_BATCH_CALL_TAG, MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS,
-};
 use percolator_match::vamm::{
-    INIT_CTX_LEN, MATCHER_MAGIC, MATCHER_VERSION, MatcherCtx, MatcherKind,
+    MatcherCtx, MatcherKind, INIT_CTX_LEN, MATCHER_MAGIC, MATCHER_VERSION,
+};
+use percolator_match::{
+    CTX_RETURN_OFFSET, CTX_VAMM_LEN, CTX_VAMM_OFFSET, FLAG_PARTIAL_OK, FLAG_REJECTED, FLAG_VALID,
+    MATCHER_ABI_VERSION, MATCHER_BATCH_CALL_TAG, MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN,
+    MATCHER_BATCH_MAX_LEGS, MATCHER_CALL_LEN, MATCHER_CALL_TAG, MATCHER_CONTEXT_LEN,
+    MATCHER_INIT_VAMM_TAG, MATCHER_RETURN_LEN,
 };
 use serde_json::json;
 
@@ -85,9 +85,9 @@ fn main() {
     });
 
     let tags = [
-        ("MatcherCall",       MATCHER_CALL_TAG as u32),
-        ("InitMatcherCtx",    MATCHER_INIT_VAMM_TAG as u32),
-        ("BatchMatcherCall",  MATCHER_BATCH_CALL_TAG as u32),
+        ("MatcherCall", MATCHER_CALL_TAG as u32),
+        ("InitMatcherCtx", MATCHER_INIT_VAMM_TAG as u32),
+        ("BatchMatcherCall", MATCHER_BATCH_CALL_TAG as u32),
     ];
 
     let flags = json!({

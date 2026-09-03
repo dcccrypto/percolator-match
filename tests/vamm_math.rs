@@ -135,7 +135,10 @@ fn passive_buy_price_above_oracle() {
     let ctx = passive_ctx(50, 5, 500, u128::MAX / 2);
     let oracle = 100_000_000u64;
     let price = passive_exec_price(&ctx, oracle, true);
-    assert!(price > oracle, "buy must price above oracle: {price} > {oracle}");
+    assert!(
+        price > oracle,
+        "buy must price above oracle: {price} > {oracle}"
+    );
 }
 
 #[test]
@@ -143,12 +146,24 @@ fn passive_sell_price_below_oracle() {
     let ctx = passive_ctx(50, 5, 500, u128::MAX / 2);
     let oracle = 100_000_000u64;
     let price = passive_exec_price(&ctx, oracle, false);
-    assert!(price < oracle, "sell must price below oracle: {price} < {oracle}");
+    assert!(
+        price < oracle,
+        "sell must price below oracle: {price} < {oracle}"
+    );
 }
 
 #[test]
 fn vamm_buy_price_above_oracle() {
-    let ctx = vamm_ctx(10, 5, 500, 100, 1_000_000_000_000, u128::MAX / 2, 0, i128::MAX as u128);
+    let ctx = vamm_ctx(
+        10,
+        5,
+        500,
+        100,
+        1_000_000_000_000,
+        u128::MAX / 2,
+        0,
+        i128::MAX as u128,
+    );
     let oracle = 100_000_000u64;
     let price = vamm_exec_price(&ctx, oracle, 1_000, true);
     assert!(price > oracle);
@@ -156,7 +171,16 @@ fn vamm_buy_price_above_oracle() {
 
 #[test]
 fn vamm_sell_price_below_oracle() {
-    let ctx = vamm_ctx(10, 5, 500, 100, 1_000_000_000_000, u128::MAX / 2, 0, i128::MAX as u128);
+    let ctx = vamm_ctx(
+        10,
+        5,
+        500,
+        100,
+        1_000_000_000_000,
+        u128::MAX / 2,
+        0,
+        i128::MAX as u128,
+    );
     let oracle = 100_000_000u64;
     let price = vamm_exec_price(&ctx, oracle, 1_000, false);
     assert!(price < oracle);
@@ -186,7 +210,10 @@ fn passive_buy_ceiling_div_known_vector() {
         expected_ceil > expected_floor,
         "oracle must not divide evenly for this test to be meaningful"
     );
-    assert_eq!(price as u128, expected_ceil, "passive buy must use ceiling division");
+    assert_eq!(
+        price as u128, expected_ceil,
+        "passive buy must use ceiling division"
+    );
 }
 
 /// Verify floor division on the sell side.
@@ -197,16 +224,31 @@ fn passive_sell_floor_div_known_vector() {
     const D: u128 = 10_000;
     let total: u128 = 55;
     let expected_floor = 100_000_001u128 * (D - total) / D;
-    assert_eq!(price as u128, expected_floor, "passive sell must use floor division");
+    assert_eq!(
+        price as u128, expected_floor,
+        "passive sell must use floor division"
+    );
 }
 
 #[test]
 fn vamm_buy_ceiling_div_small_size() {
     // With tiny req_size=1 relative to liquidity=1e12, impact is negligible.
     // total_bps ≈ base+fee = 15. Similar non-even oracle to passive test above.
-    let ctx = vamm_ctx(10, 5, 500, 100, 1_000_000_000_000u128, u128::MAX / 2, 0, i128::MAX as u128);
+    let ctx = vamm_ctx(
+        10,
+        5,
+        500,
+        100,
+        1_000_000_000_000u128,
+        u128::MAX / 2,
+        0,
+        i128::MAX as u128,
+    );
     let price = vamm_exec_price(&ctx, 100_000_001, 1, true);
-    assert!(price as u128 >= 100_000_001u128, "vAMM buy must be >= oracle");
+    assert!(
+        price as u128 >= 100_000_001u128,
+        "vAMM buy must be >= oracle"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -215,20 +257,44 @@ fn vamm_buy_ceiling_div_small_size() {
 
 #[test]
 fn vamm_larger_size_higher_buy_price() {
-    let ctx = vamm_ctx(10, 5, 500, 100, 1_000_000_000_000u128, u128::MAX / 2, 0, i128::MAX as u128);
+    let ctx = vamm_ctx(
+        10,
+        5,
+        500,
+        100,
+        1_000_000_000_000u128,
+        u128::MAX / 2,
+        0,
+        i128::MAX as u128,
+    );
     let oracle = 100_000_000u64;
     let small = vamm_exec_price(&ctx, oracle, 1_000, true);
     let large = vamm_exec_price(&ctx, oracle, 100_000_000, true);
-    assert!(large > small, "larger size must produce higher buy price: {large} > {small}");
+    assert!(
+        large > small,
+        "larger size must produce higher buy price: {large} > {small}"
+    );
 }
 
 #[test]
 fn vamm_larger_size_lower_sell_price() {
-    let ctx = vamm_ctx(10, 5, 500, 100, 1_000_000_000_000u128, u128::MAX / 2, 0, i128::MAX as u128);
+    let ctx = vamm_ctx(
+        10,
+        5,
+        500,
+        100,
+        1_000_000_000_000u128,
+        u128::MAX / 2,
+        0,
+        i128::MAX as u128,
+    );
     let oracle = 100_000_000u64;
     let small = vamm_exec_price(&ctx, oracle, 1_000, false);
     let large = vamm_exec_price(&ctx, oracle, 100_000_000, false);
-    assert!(large < small, "larger sell size must produce lower sell price");
+    assert!(
+        large < small,
+        "larger sell size must produce lower sell price"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -237,7 +303,16 @@ fn vamm_larger_size_lower_sell_price() {
 
 #[test]
 fn vamm_total_bps_never_exceeds_max() {
-    let ctx = vamm_ctx(10, 5, 200, 100, 1_000_000_000_000u128, u128::MAX / 2, 0, i128::MAX as u128);
+    let ctx = vamm_ctx(
+        10,
+        5,
+        200,
+        100,
+        1_000_000_000_000u128,
+        u128::MAX / 2,
+        0,
+        i128::MAX as u128,
+    );
     let oracle = 100_000_000u64;
     // Extremely large size should be capped
     let price = vamm_exec_price(&ctx, oracle, 1_000_000_000_000_000u128, true);
@@ -249,7 +324,10 @@ fn vamm_total_bps_never_exceeds_max() {
         price <= ceil_max,
         "exec price {price} must not exceed max_total_bps ceiling {ceil_max}"
     );
-    assert!(price > max_price_floor, "exec price must be above oracle for buy");
+    assert!(
+        price > max_price_floor,
+        "exec price must be above oracle for buy"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +358,16 @@ fn max_fill_zero_returns_partial_flag_and_zero_size() {
     // We verify via the vamm_exec_price model: size goes to zero.
     // (Direct flag test is in the inline vamm.rs tests; here we confirm the
     //  PARTIAL logic via the ctx.max_fill_abs path.)
-    let ctx = vamm_ctx(10, 5, 500, 100, 1_000_000_000_000u128, 0, 0, i128::MAX as u128);
+    let ctx = vamm_ctx(
+        10,
+        5,
+        500,
+        100,
+        1_000_000_000_000u128,
+        0,
+        0,
+        i128::MAX as u128,
+    );
     // A zero max_fill_abs should yield FLAG_VALID | FLAG_PARTIAL_OK and exec_size=0.
     // We document what the flag values are so the test itself is the lock.
     assert_eq!(FLAG_VALID, 1u32);
@@ -312,7 +399,7 @@ fn fill_size_capped_at_max_fill_abs() {
 ///   insurance   = 1_000_000 * 500 / 10_000 = 50_000
 #[test]
 fn insurance_fee_known_vector() {
-    let trading_fee_bps: u128 = 100;    // 1%
+    let trading_fee_bps: u128 = 100; // 1%
     let fee_to_insurance_bps: u128 = 500; // 5% of trading fee
     let exec_size: i128 = 1_000_000;
     let exec_price: u64 = 100_000_000;
@@ -361,7 +448,16 @@ fn passive_oracle_near_max_u64_buy_does_not_panic() {
 #[test]
 fn vamm_oracle_large_buy_does_not_overflow() {
     let large_oracle: u64 = u64::MAX / 2;
-    let ctx = vamm_ctx(10, 5, 100, 10, 1_000_000_000_000_000_000u128, u128::MAX / 2, 0, i128::MAX as u128);
+    let ctx = vamm_ctx(
+        10,
+        5,
+        100,
+        10,
+        1_000_000_000_000_000_000u128,
+        u128::MAX / 2,
+        0,
+        i128::MAX as u128,
+    );
     let price = vamm_exec_price(&ctx, large_oracle, 1, true);
     assert!(price as u128 >= large_oracle as u128);
 }
@@ -372,9 +468,17 @@ fn vamm_oracle_large_buy_does_not_overflow() {
 
 /// Helper: replicate compute_skew_extra_bps logic inline.
 fn skew_extra(inventory_base: i128, skew_spread_mult_bps: u16, is_buy: bool) -> u128 {
-    if skew_spread_mult_bps == 0 { return 0; }
-    let worsens = if is_buy { inventory_base < 0 } else { inventory_base > 0 };
-    if !worsens { return 0; }
+    if skew_spread_mult_bps == 0 {
+        return 0;
+    }
+    let worsens = if is_buy {
+        inventory_base < 0
+    } else {
+        inventory_base > 0
+    };
+    if !worsens {
+        return 0;
+    }
     let inv_abs = inventory_base.unsigned_abs();
     let mult = skew_spread_mult_bps as u128;
     let extra = inv_abs.saturating_mul(mult) / 10_000;
