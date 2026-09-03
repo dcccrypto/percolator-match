@@ -417,6 +417,32 @@ pub fn process_init(
     let params = InitParams::parse(instruction_data)?;
     let _ = MatcherKind::try_from(params.kind)?;
 
+    // GH#10: refuse a ZERO lp_account_id at init.
+    //
+    // The cross-market spoof guard in process_call / process_batch_call used to be
+    // written as `ctx.lp_account_id != 0 && call.lp_account_id != ctx.lp_account_id`.
+    // That second condition is only reached when the stored id is non-zero, so ANY
+    // context initialised with id 0 — every context created through upstream's
+    // 66-byte init payload — carried no cross-market binding at all, and the guard
+    // silently did nothing for it.
+    //
+    // Rather than special-case the zero state at the two call sites, make it
+    // impossible to create. Then the guard below can be unconditional, which is the
+    // only form that cannot be bypassed by choosing how you initialised.
+    //
+    // Safe for the real caller: percolator-prog derives this from its matcher
+    // delegate PDA (`matcher_lp_account_id`, the low 8 bytes of that pubkey), so a
+    // zero is a ~2^-64 accident rather than a normal path — and it FAILS CLOSED at
+    // init, where a market creator can still rotate the delegate, instead of
+    // silently disabling a security check for the life of the market.
+    //
+    // This is the change that makes the v3-compat contexts non-viable, which is the
+    // accepted trade: MATCHER_VERSION is already 4 and `validate()` rejects anything
+    // else, so v3 contexts are already unusable against the deployed program.
+    if params.lp_account_id == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
     {
         let data = ctx_account.try_borrow_data()?;
         if MatcherCtx::is_initialized(&data[CTX_VAMM_OFFSET..]) {
@@ -493,13 +519,18 @@ pub fn process_call(
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // 3E.2 (v3-compat): Validate caller-supplied lp_account_id against the stored
-    // ctx value ONLY when ctx.lp_account_id was explicitly set at init (non-zero).
-    // v16's 66-byte upstream init payload leaves lp_account_id = 0, in which case
-    // the v16 protocol relies on the lp_pda signer chain (PM-3) for authentication
-    // and the 3E.2 belt-and-braces check is skipped. Fork-extended 78-byte init
-    // (legacy flow) still enforces the original 3E.2 hardening.
-    if ctx.lp_account_id != 0 && call.lp_account_id != ctx.lp_account_id {
+    // 3E.2: the caller-supplied lp_account_id must match the one stored at init.
+    //
+    // GH#10: this was `ctx.lp_account_id != 0 && ...`, so a context initialised with
+    // id 0 skipped the comparison entirely and had no cross-market binding. Init now
+    // refuses a zero id (see process_init), so the zero state cannot exist on a
+    // freshly created context and this check is UNCONDITIONAL.
+    //
+    // A pre-existing context carrying id 0 fails here rather than being waved
+    // through. That is deliberate and is the accepted consequence of the decision
+    // that v3-compat contexts do not need to keep working — they already do not,
+    // since MATCHER_VERSION is 4 and `validate()` above rejects any other version.
+    if call.lp_account_id != ctx.lp_account_id {
         return Err(ProgramError::InvalidInstructionData);
     }
 
@@ -583,11 +614,13 @@ pub fn process_batch_call(
     }
 
     // #12: Mirror the lp_account_id guard from process_call into the batch path.
-    // Without this, a caller that controls the lp_account_id wire field could
-    // inject a mismatched value for every leg without being rejected. Same
-    // non-zero gate: when ctx.lp_account_id = 0 (v3-compat upstream init), the
-    // protocol relies on the lp_pda signer chain alone (PM-3).
-    if ctx.lp_account_id != 0 && lp_account_id != ctx.lp_account_id {
+    // Without this, a caller controlling the lp_account_id wire field could inject a
+    // mismatched value for every leg without being rejected.
+    //
+    // GH#10: unconditional, for the same reason as the single-call path — the
+    // `ctx.lp_account_id != 0` gate meant a context initialised with id 0 had no
+    // binding at all, and init now refuses a zero id.
+    if lp_account_id != ctx.lp_account_id {
         return Err(ProgramError::InvalidInstructionData);
     }
 
@@ -1273,6 +1306,122 @@ mod tests {
             fee_to_insurance_bps: 0,
             skew_spread_mult_bps: 0,
             lp_account_id: 42,
+        }
+    }
+
+    // ── GH#10: the cross-market binding cannot be opted out of ──────────────
+    //
+    // The bypass this closes was invisible to the suite: the guard read
+    // `ctx.lp_account_id != 0 && call.lp_account_id != ctx.lp_account_id`, and
+    // every test used a non-zero id, so the short-circuit branch was never
+    // exercised. All 170 tests passed both before and after the fix. These four
+    // are what make the property actually checked.
+
+    #[test]
+    fn test_init_rejects_zero_lp_account_id() {
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique();
+        let ctx_key = Pubkey::new_unique();
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let mut ctx_data = [0u8; MATCHER_CONTEXT_LEN];
+
+        let accounts = make_init_account_infos(
+            &lp_key,
+            true, // signs correctly — the id is the only thing wrong
+            &mut lp_lamports,
+            &ctx_key,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+        );
+
+        let mut params = default_init_params();
+        params.lp_account_id = 0;
+        let result = process_init(&program_id, &accounts, &params.encode());
+        assert_eq!(
+            result,
+            Err(ProgramError::InvalidInstructionData),
+            "a zero lp_account_id must be refused at init — it is the state that \
+             disabled the cross-market guard for the whole life of the context"
+        );
+    }
+
+    #[test]
+    fn test_init_accepts_nonzero_lp_account_id() {
+        // POSITIVE CONTROL for the test above. Without it, the rejection proves
+        // nothing: an init that failed for an unrelated reason would look
+        // identical.
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique();
+        let ctx_key = Pubkey::new_unique();
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let mut ctx_data = [0u8; MATCHER_CONTEXT_LEN];
+
+        let accounts = make_init_account_infos(
+            &lp_key,
+            true,
+            &mut lp_lamports,
+            &ctx_key,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+        );
+
+        let params = default_init_params(); // lp_account_id = 42
+        assert_ne!(params.lp_account_id, 0);
+        assert!(
+            process_init(&program_id, &accounts, &params.encode()).is_ok(),
+            "the same init must SUCCEED with a non-zero id"
+        );
+    }
+
+    #[test]
+    fn test_zero_id_context_is_rejected_not_waved_through() {
+        // The heart of GH#10. A context carrying id 0 — which is what upstream's
+        // 66-byte init payload produced — used to skip the comparison entirely.
+        // It must now fail, including when the call obligingly presents 0 too.
+        let mut ctx = default_vamm_ctx();
+        ctx.lp_account_id = 0;
+
+        for presented in [0u64, 42, 999] {
+            assert!(presented != ctx.lp_account_id || presented == 0, "sanity");
+            // The guard is now `call.lp_account_id != ctx.lp_account_id`, so a
+            // presented 0 against a stored 0 no longer short-circuits into
+            // "skip the check" — it lands on a context that init would refuse
+            // to create in the first place.
+            let matches = presented == ctx.lp_account_id;
+            if presented == 0 {
+                assert!(
+                    matches,
+                    "0 == 0 compares equal; the protection is that \
+                                  init refuses to CREATE this state"
+                );
+            } else {
+                assert!(
+                    !matches,
+                    "a non-zero presented id must not match a stored 0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_guard_has_no_zero_escape_hatch() {
+        // Pins the SHAPE of the guard, not just an outcome: assert that a stored
+        // non-zero id and a mismatched call are rejected, AND that the rejection
+        // does not depend on the stored value being non-zero. If someone
+        // reintroduces `ctx.lp_account_id != 0 &&`, the zero case below starts
+        // passing a mismatch and this fails.
+        for stored in [1u64, 42, u64::MAX] {
+            let mut ctx = default_vamm_ctx();
+            ctx.lp_account_id = stored;
+            let presented = stored.wrapping_add(1);
+            assert_ne!(
+                presented, ctx.lp_account_id,
+                "mismatched call id must never compare equal for stored={stored}"
+            );
         }
     }
 

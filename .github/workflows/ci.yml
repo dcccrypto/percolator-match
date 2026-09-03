@@ -1,0 +1,160 @@
+name: CI
+
+# percolator-match had NO CI at all until this file — no workflows directory,
+# nothing ever run against it. It is one of the five on-chain programs, it is
+# DEPLOYED (d4d4f1c), and it carries 174 unit and integration tests that had
+# never once executed outside a developer's laptop.
+#
+# Three things this workflow is deliberately shaped by, all learned from the
+# sibling repos in the same week it was written:
+#
+#  1. IT MUST BE GREEN ON ARRIVAL. percolator-prog spent three days red and
+#     percolator-stake two, and in both cases the red was ignored precisely
+#     because it was permanent. `cargo fmt` had never been run on this crate, so
+#     it was formatted in its own commit BEFORE this gate started enforcing it.
+#
+#  2. THE BPF BUILD IS NOT OPTIONAL. `cargo test` compiles for the host. The
+#     artifact that actually gets deployed is the SBF `.so`, and it can fail to
+#     build while every host test passes — a real and separate signal.
+#
+#  3. THE PARITY FIXTURE IS PART OF THE CONTRACT. This crate ships
+#     src/bin/sdk_parity_fixtures.rs, which percolator-sdk's Parity Gate compares
+#     against specs/matcher-parity.json. That gate lives in the SDK repo and only
+#     fires on SDK pull requests, so an ABI change merged HERE would not be
+#     checked there until someone happened to open an unrelated SDK PR. Running
+#     the fixture here closes that hole from this side.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: short
+
+jobs:
+  test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Fails the job on ANY difference. Enforceable only because the crate was
+      # formatted in a separate, prior commit.
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      # -D warnings on our own crate. Applied via the command rather than a
+      # global RUSTFLAGS env var: exporting it would impose deny-warnings on
+      # every dependency compiled here too, which is how percolator-stake's CI
+      # broke on an `unused_mut` in the engine it does not own.
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --all-targets
+
+      # Proof of life for the count. `cargo test` prints "ok. 0 passed" for a
+      # target with no tests, and a harness that silently stopped collecting
+      # would look identical to a pass. 174 is the measured total when this
+      # workflow was added (79 vamm + 17 passive_lp unit, plus 78 across
+      # tests/). If a test is legitimately added or removed, update this number
+      # in the same commit — that is the point.
+      - name: assert the suite actually ran
+        run: |
+          total=$(cargo test --all-targets 2>&1 \
+            | grep -E '^test result:' \
+            | awk '{p += $4} END {print p+0}')
+          echo "tests executed: $total"
+          if [ "$total" -lt 174 ]; then
+            echo "::error::only $total tests ran, expected at least 174 —"
+            echo "::error::either a test target stopped being collected, or tests were"
+            echo "::error::removed without updating this floor."
+            exit 1
+          fi
+
+  bpf:
+    name: build-sbf (the deployable artifact)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: install Solana toolchain (provides cargo-build-sbf)
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: build-sbf
+        run: cargo build-sbf
+
+      # A missing .so would otherwise let a broken build look like a pass, the
+      # same way percolator-stake's e2e suites pass VACUOUSLY when their .so is
+      # absent. Assert the artifact exists and log its size so a sudden change
+      # is visible in the log.
+      - name: assert the .so exists
+        run: |
+          so=target/deploy/percolator_match.so
+          if [ ! -f "$so" ]; then
+            echo "::error::$so missing — build-sbf reported success without producing an artifact"
+            exit 1
+          fi
+          ls -l "$so"
+          echo "sha256: $(sha256sum "$so" | cut -d' ' -f1)"
+
+  parity:
+    name: sdk parity fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: percolator-match
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/percolator-sdk
+          path: percolator-sdk
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: percolator-match
+
+      # Compare this crate's emitted ABI fixture against the spec the SDK holds.
+      # Byte-exact, which is what percolator-sdk/scripts/check-parity-fixtures.mjs
+      # itself asserts — so a mismatch here is the same failure the SDK's gate
+      # would report, caught at the moment the change lands rather than whenever
+      # an SDK PR next happens to run.
+      - name: fixture matches the SDK spec
+        run: |
+          fresh=$(cd percolator-match && cargo run --quiet --bin sdk_parity_fixtures)
+          spec=percolator-sdk/specs/matcher-parity.json
+          if [ ! -f "$spec" ]; then
+            echo "::error::$spec not found in the SDK checkout"
+            exit 1
+          fi
+          if [ "$fresh" != "$(cat "$spec")" ]; then
+            echo "::error::matcher ABI drift — the fixture no longer matches $spec."
+            echo "::error::If this change is intended, run \`pnpm update-parity-fixtures\`"
+            echo "::error::in percolator-sdk and land the spec update alongside it."
+            echo "--- committed spec ---"
+            cat "$spec"
+            echo "--- emitted now ---"
+            printf '%s\n' "$fresh"
+            exit 1
+          fi
+          echo "matcher parity OK"
