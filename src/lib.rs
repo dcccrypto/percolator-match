@@ -250,7 +250,9 @@ pub fn process_instruction(
 
     match instruction_data[0] {
         MATCHER_CALL_TAG => process_matcher_call(program_id, accounts, instruction_data),
-        MATCHER_BATCH_CALL_TAG => process_batch_matcher_call(program_id, accounts, instruction_data),
+        MATCHER_BATCH_CALL_TAG => {
+            process_batch_matcher_call(program_id, accounts, instruction_data)
+        }
         MATCHER_INIT_VAMM_TAG => vamm::process_init(program_id, accounts, instruction_data),
         _ => Err(ProgramError::InvalidInstructionData),
     }

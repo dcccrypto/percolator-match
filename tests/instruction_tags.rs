@@ -15,13 +15,19 @@ use percolator_match::{
 #[test]
 fn tag_matcher_call_is_0() {
     // Tag 0 is what percolator-prog sends for every TradeCpi / TradeCpiV2 CPI.
-    assert_eq!(MATCHER_CALL_TAG, 0u8, "MATCHER_CALL_TAG must be 0 — breaking change");
+    assert_eq!(
+        MATCHER_CALL_TAG, 0u8,
+        "MATCHER_CALL_TAG must be 0 — breaking change"
+    );
 }
 
 #[test]
 fn tag_matcher_init_vamm_is_2() {
     // Tag 2 is the InitMatcherCtx instruction dispatched from percolator-prog (tag 75).
-    assert_eq!(MATCHER_INIT_VAMM_TAG, 2u8, "MATCHER_INIT_VAMM_TAG must be 2 — breaking change");
+    assert_eq!(
+        MATCHER_INIT_VAMM_TAG, 2u8,
+        "MATCHER_INIT_VAMM_TAG must be 2 — breaking change"
+    );
 }
 
 #[test]
@@ -29,7 +35,10 @@ fn abi_version_is_3() {
     // MATCHER_ABI_VERSION is echoed in every MatcherReturn. The SDK and keeper both assert
     // this value; bumping it without coordinating breaks all active markets. v3 added
     // the `asset_index` echo field replacing v2's `reserved` u64.
-    assert_eq!(MATCHER_ABI_VERSION, 3u32, "MATCHER_ABI_VERSION must be 3 — breaking change");
+    assert_eq!(
+        MATCHER_ABI_VERSION, 3u32,
+        "MATCHER_ABI_VERSION must be 3 — breaking change"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -53,15 +62,24 @@ fn parse_init_vamm_tag_byte() {
 fn tag_batch_call_is_3() {
     // Tag 3 is the batched multi-fill CPI instruction added in v17 convergence.
     // ABI version stays 3; single-fill (tag 0) is unchanged.
-    assert_eq!(MATCHER_BATCH_CALL_TAG, 3u8, "MATCHER_BATCH_CALL_TAG must be 3 — breaking change");
+    assert_eq!(
+        MATCHER_BATCH_CALL_TAG, 3u8,
+        "MATCHER_BATCH_CALL_TAG must be 3 — breaking change"
+    );
 }
 
 #[test]
 fn batch_layout_constants_locked() {
     // These values are part of the on-chain wire format; changing them breaks the wrapper CPI.
-    assert_eq!(MATCHER_BATCH_HEADER_LEN, 18, "batch header must be 18 bytes");
+    assert_eq!(
+        MATCHER_BATCH_HEADER_LEN, 18,
+        "batch header must be 18 bytes"
+    );
     assert_eq!(MATCHER_BATCH_LEG_LEN, 26, "each batch leg must be 26 bytes");
-    assert_eq!(MATCHER_BATCH_MAX_LEGS, 16, "max 16 legs per batch (16*64=1024 return-data cap)");
+    assert_eq!(
+        MATCHER_BATCH_MAX_LEGS, 16,
+        "max 16 legs per batch (16*64=1024 return-data cap)"
+    );
 }
 
 #[test]
@@ -107,6 +125,9 @@ fn init_params_tag_byte_at_offset_0() {
         lp_account_id: 1,
     };
     let encoded = params.encode();
-    assert_eq!(encoded[0], MATCHER_INIT_VAMM_TAG, "tag byte must be at offset 0");
+    assert_eq!(
+        encoded[0], MATCHER_INIT_VAMM_TAG,
+        "tag byte must be at offset 0"
+    );
     assert_eq!(encoded[1], 0u8, "kind=0 (Passive) at offset 1");
 }

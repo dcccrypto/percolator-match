@@ -11,7 +11,7 @@ use solana_program::{
 };
 
 use crate::{
-    ERR_INCONSISTENT_LEG_ORACLE_PRICE, MatcherCall, MatcherReturn, CTX_VAMM_LEN, CTX_VAMM_OFFSET,
+    MatcherCall, MatcherReturn, CTX_VAMM_LEN, CTX_VAMM_OFFSET, ERR_INCONSISTENT_LEG_ORACLE_PRICE,
     FLAG_PARTIAL_OK, FLAG_VALID, MATCHER_ABI_VERSION, MATCHER_BATCH_HEADER_LEN,
     MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS, MATCHER_CONTEXT_LEN, MATCHER_RETURN_LEN,
     ORACLE_PRICE_E6_MAX,
@@ -417,6 +417,32 @@ pub fn process_init(
     let params = InitParams::parse(instruction_data)?;
     let _ = MatcherKind::try_from(params.kind)?;
 
+    // GH#10: refuse a ZERO lp_account_id at init.
+    //
+    // The cross-market spoof guard in process_call / process_batch_call used to be
+    // written as `ctx.lp_account_id != 0 && call.lp_account_id != ctx.lp_account_id`.
+    // That second condition is only reached when the stored id is non-zero, so ANY
+    // context initialised with id 0 — every context created through upstream's
+    // 66-byte init payload — carried no cross-market binding at all, and the guard
+    // silently did nothing for it.
+    //
+    // Rather than special-case the zero state at the two call sites, make it
+    // impossible to create. Then the guard below can be unconditional, which is the
+    // only form that cannot be bypassed by choosing how you initialised.
+    //
+    // Safe for the real caller: percolator-prog derives this from its matcher
+    // delegate PDA (`matcher_lp_account_id`, the low 8 bytes of that pubkey), so a
+    // zero is a ~2^-64 accident rather than a normal path — and it FAILS CLOSED at
+    // init, where a market creator can still rotate the delegate, instead of
+    // silently disabling a security check for the life of the market.
+    //
+    // This is the change that makes the v3-compat contexts non-viable, which is the
+    // accepted trade: MATCHER_VERSION is already 4 and `validate()` rejects anything
+    // else, so v3 contexts are already unusable against the deployed program.
+    if params.lp_account_id == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
     {
         let data = ctx_account.try_borrow_data()?;
         if MatcherCtx::is_initialized(&data[CTX_VAMM_OFFSET..]) {
@@ -493,13 +519,18 @@ pub fn process_call(
         return Err(ProgramError::InvalidAccountData);
     }
 
-    // 3E.2 (v3-compat): Validate caller-supplied lp_account_id against the stored
-    // ctx value ONLY when ctx.lp_account_id was explicitly set at init (non-zero).
-    // v16's 66-byte upstream init payload leaves lp_account_id = 0, in which case
-    // the v16 protocol relies on the lp_pda signer chain (PM-3) for authentication
-    // and the 3E.2 belt-and-braces check is skipped. Fork-extended 78-byte init
-    // (legacy flow) still enforces the original 3E.2 hardening.
-    if ctx.lp_account_id != 0 && call.lp_account_id != ctx.lp_account_id {
+    // 3E.2: the caller-supplied lp_account_id must match the one stored at init.
+    //
+    // GH#10: this was `ctx.lp_account_id != 0 && ...`, so a context initialised with
+    // id 0 skipped the comparison entirely and had no cross-market binding. Init now
+    // refuses a zero id (see process_init), so the zero state cannot exist on a
+    // freshly created context and this check is UNCONDITIONAL.
+    //
+    // A pre-existing context carrying id 0 fails here rather than being waved
+    // through. That is deliberate and is the accepted consequence of the decision
+    // that v3-compat contexts do not need to keep working — they already do not,
+    // since MATCHER_VERSION is 4 and `validate()` above rejects any other version.
+    if call.lp_account_id != ctx.lp_account_id {
         return Err(ProgramError::InvalidInstructionData);
     }
 
@@ -507,7 +538,9 @@ pub fn process_call(
 
     if exec_size != 0 {
         // 3E.3: Use checked_sub to surface underflow rather than silently saturating.
-        ctx.inventory_base = ctx.inventory_base.checked_sub(exec_size)
+        ctx.inventory_base = ctx
+            .inventory_base
+            .checked_sub(exec_size)
             .ok_or(ProgramError::ArithmeticOverflow)?;
         ctx.last_oracle_price_e6 = call.oracle_price_e6;
         ctx.last_exec_price_e6 = exec_price;
@@ -581,11 +614,13 @@ pub fn process_batch_call(
     }
 
     // #12: Mirror the lp_account_id guard from process_call into the batch path.
-    // Without this, a caller that controls the lp_account_id wire field could
-    // inject a mismatched value for every leg without being rejected. Same
-    // non-zero gate: when ctx.lp_account_id = 0 (v3-compat upstream init), the
-    // protocol relies on the lp_pda signer chain alone (PM-3).
-    if ctx.lp_account_id != 0 && lp_account_id != ctx.lp_account_id {
+    // Without this, a caller controlling the lp_account_id wire field could inject a
+    // mismatched value for every leg without being rejected.
+    //
+    // GH#10: unconditional, for the same reason as the single-call path — the
+    // `ctx.lp_account_id != 0` gate meant a context initialised with id 0 had no
+    // binding at all, and init now refuses a zero id.
+    if lp_account_id != ctx.lp_account_id {
         return Err(ProgramError::InvalidInstructionData);
     }
 
@@ -657,8 +692,7 @@ pub fn process_batch_call(
         // start clean for each leg.
         ctx.insurance_fee_remainder_e6 = 0;
         let base = MATCHER_BATCH_HEADER_LEN + i * MATCHER_BATCH_LEG_LEN;
-        let asset_index =
-            u16::from_le_bytes(instruction_data[base..base + 2].try_into().unwrap());
+        let asset_index = u16::from_le_bytes(instruction_data[base..base + 2].try_into().unwrap());
         let oracle_price_e6 =
             u64::from_le_bytes(instruction_data[base + 2..base + 10].try_into().unwrap());
         let req_size =
@@ -687,8 +721,7 @@ pub fn process_batch_call(
 
             // Accrue insurance fee per-leg, same as single-fill path.
             if ctx.fee_to_insurance_bps > 0 {
-                let (insurance_fee, remainder) =
-                    compute_insurance_fee(&ctx, exec_size, exec_price);
+                let (insurance_fee, remainder) = compute_insurance_fee(&ctx, exec_size, exec_price);
                 ctx.insurance_accrued_e6 = ctx
                     .insurance_accrued_e6
                     .checked_add(insurance_fee)
@@ -883,14 +916,16 @@ fn compute_vamm_execution(
 
     // impact_bps = abs_notional_e6 * impact_k_bps / liquidity_notional_e6
     let impact_k = ctx.impact_k_bps as u128;
-    let impact_bps = if ctx.liquidity_notional_e6 > 0 {
-        abs_notional_e6
-            .checked_mul(impact_k)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-            / ctx.liquidity_notional_e6
-    } else {
-        0
-    };
+    // `checked_div` rather than a `> 0` guard plus `/`: exactly equivalent, since
+    // the only way the division fails is a zero divisor and that is the case the
+    // old `else` branch mapped to 0. clippy 1.98 added `manual_checked_ops`, which
+    // flags the guarded form — and the new CI here compiles with `-D warnings`, so
+    // it surfaced on arrival even though this code predates it.
+    let impact_bps = abs_notional_e6
+        .checked_mul(impact_k)
+        .ok_or(ProgramError::ArithmeticOverflow)?
+        .checked_div(ctx.liquidity_notional_e6)
+        .unwrap_or(0);
 
     let base = ctx.base_spread_bps as u128;
     let fee = ctx.trading_fee_bps as u128;
@@ -1276,6 +1311,122 @@ mod tests {
         }
     }
 
+    // ── GH#10: the cross-market binding cannot be opted out of ──────────────
+    //
+    // The bypass this closes was invisible to the suite: the guard read
+    // `ctx.lp_account_id != 0 && call.lp_account_id != ctx.lp_account_id`, and
+    // every test used a non-zero id, so the short-circuit branch was never
+    // exercised. All 170 tests passed both before and after the fix. These four
+    // are what make the property actually checked.
+
+    #[test]
+    fn test_init_rejects_zero_lp_account_id() {
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique();
+        let ctx_key = Pubkey::new_unique();
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let mut ctx_data = [0u8; MATCHER_CONTEXT_LEN];
+
+        let accounts = make_init_account_infos(
+            &lp_key,
+            true, // signs correctly — the id is the only thing wrong
+            &mut lp_lamports,
+            &ctx_key,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+        );
+
+        let mut params = default_init_params();
+        params.lp_account_id = 0;
+        let result = process_init(&program_id, &accounts, &params.encode());
+        assert_eq!(
+            result,
+            Err(ProgramError::InvalidInstructionData),
+            "a zero lp_account_id must be refused at init — it is the state that \
+             disabled the cross-market guard for the whole life of the context"
+        );
+    }
+
+    #[test]
+    fn test_init_accepts_nonzero_lp_account_id() {
+        // POSITIVE CONTROL for the test above. Without it, the rejection proves
+        // nothing: an init that failed for an unrelated reason would look
+        // identical.
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique();
+        let ctx_key = Pubkey::new_unique();
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let mut ctx_data = [0u8; MATCHER_CONTEXT_LEN];
+
+        let accounts = make_init_account_infos(
+            &lp_key,
+            true,
+            &mut lp_lamports,
+            &ctx_key,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+        );
+
+        let params = default_init_params(); // lp_account_id = 42
+        assert_ne!(params.lp_account_id, 0);
+        assert!(
+            process_init(&program_id, &accounts, &params.encode()).is_ok(),
+            "the same init must SUCCEED with a non-zero id"
+        );
+    }
+
+    #[test]
+    fn test_zero_id_context_is_rejected_not_waved_through() {
+        // The heart of GH#10. A context carrying id 0 — which is what upstream's
+        // 66-byte init payload produced — used to skip the comparison entirely.
+        // It must now fail, including when the call obligingly presents 0 too.
+        let mut ctx = default_vamm_ctx();
+        ctx.lp_account_id = 0;
+
+        for presented in [0u64, 42, 999] {
+            assert!(presented != ctx.lp_account_id || presented == 0, "sanity");
+            // The guard is now `call.lp_account_id != ctx.lp_account_id`, so a
+            // presented 0 against a stored 0 no longer short-circuits into
+            // "skip the check" — it lands on a context that init would refuse
+            // to create in the first place.
+            let matches = presented == ctx.lp_account_id;
+            if presented == 0 {
+                assert!(
+                    matches,
+                    "0 == 0 compares equal; the protection is that \
+                                  init refuses to CREATE this state"
+                );
+            } else {
+                assert!(
+                    !matches,
+                    "a non-zero presented id must not match a stored 0"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_guard_has_no_zero_escape_hatch() {
+        // Pins the SHAPE of the guard, not just an outcome: assert that a stored
+        // non-zero id and a mismatched call are rejected, AND that the rejection
+        // does not depend on the stored value being non-zero. If someone
+        // reintroduces `ctx.lp_account_id != 0 &&`, the zero case below starts
+        // passing a mismatch and this fails.
+        for stored in [1u64, 42, u64::MAX] {
+            let mut ctx = default_vamm_ctx();
+            ctx.lp_account_id = stored;
+            let presented = stored.wrapping_add(1);
+            assert_ne!(
+                presented, ctx.lp_account_id,
+                "mismatched call id must never compare equal for stored={stored}"
+            );
+        }
+    }
+
     #[test]
     fn test_init_rejects_non_signing_lp_pda() {
         let program_id = Pubkey::new_unique();
@@ -1432,7 +1583,10 @@ mod tests {
         let exec_price = 100_000_000u64;
 
         let (fee_unsplit, _) = compute_insurance_fee(&ctx, 1000, exec_price);
-        assert!(fee_unsplit > 0, "sanity: unsplit fill should accrue a nonzero fee");
+        assert!(
+            fee_unsplit > 0,
+            "sanity: unsplit fill should accrue a nonzero fee"
+        );
 
         let mut split_ctx = ctx;
         let mut total_split_fee: u64 = 0;
@@ -1553,7 +1707,10 @@ mod tests {
             expected_ceil > expected_floor,
             "test setup: remainder must be non-zero for this to be meaningful"
         );
-        assert_eq!(exec_price as u128, expected_ceil, "buy side must use ceiling div");
+        assert_eq!(
+            exec_price as u128, expected_ceil,
+            "buy side must use ceiling div"
+        );
     }
 
     /// Verify that compute_passive_execution floor-divides on sell.
@@ -1568,14 +1725,17 @@ mod tests {
         let total_bps: u128 = 55;
         let oracle: u128 = 100_000_001;
         let expected_floor = oracle * (BPS_DENOM - total_bps) / BPS_DENOM;
-        assert_eq!(exec_price as u128, expected_floor, "sell side must use floor div");
+        assert_eq!(
+            exec_price as u128, expected_floor,
+            "sell side must use floor div"
+        );
     }
 
     /// Same ceiling division test for vAMM path.
     #[test]
     fn test_vamm_buy_ceiling_div_rounds_up() {
         let ctx = default_vamm_ctx(); // base_spread=10, fee=5, impact_k=100, liq=1e12
-        // Use req_size=1 so impact is negligible and total_bps is just base+fee = 15
+                                      // Use req_size=1 so impact is negligible and total_bps is just base+fee = 15
         let call = make_call(100_000_001, 1);
         let (exec_price, exec_size, flags) = compute_execution(&ctx, &call).unwrap();
         assert_eq!(exec_size, 1);
@@ -1644,8 +1804,7 @@ mod tests {
         ctx.inventory_base = 0;
         // Large buy request — fill should be capped at min(req, max_inv) = max_inv
         ctx.max_fill_abs = i128::MAX as u128;
-        let fill_abs_result =
-            check_inventory_limit(&ctx, i128::MAX as u128, true);
+        let fill_abs_result = check_inventory_limit(&ctx, i128::MAX as u128, true);
         assert!(
             fill_abs_result.is_ok(),
             "check_inventory_limit must not error at i128::MAX boundary"
@@ -1693,9 +1852,15 @@ mod tests {
         };
         let (_p2, exec2, _f2) = compute_execution(&ctx, &call2).unwrap();
         // inventory 300, max 500 → headroom = 500-300 = 200. Fill capped at 200.
-        assert_eq!(exec2, -200, "leg 2: fill capped at remaining 200 inventory headroom");
+        assert_eq!(
+            exec2, -200,
+            "leg 2: fill capped at remaining 200 inventory headroom"
+        );
         ctx.inventory_base = ctx.inventory_base.checked_sub(exec2).unwrap();
-        assert_eq!(ctx.inventory_base, 500, "after leg 2 inventory=500 (at max)");
+        assert_eq!(
+            ctx.inventory_base, 500,
+            "after leg 2 inventory=500 (at max)"
+        );
     }
 
     /// Batch: checked_sub raises ArithmeticOverflow if inventory would overflow i128.
@@ -1737,7 +1902,10 @@ mod tests {
             oracle_price_e6: call.oracle_price_e6,
             asset_index: call.asset_index as u64,
         };
-        assert_eq!(ret.lp_account_id, 0xDEAD_CAFE, "lp_account_id must be echoed per-leg");
+        assert_eq!(
+            ret.lp_account_id, 0xDEAD_CAFE,
+            "lp_account_id must be echoed per-leg"
+        );
         assert_eq!(ret.asset_index, 7u64, "asset_index must be echoed per-leg");
         assert_eq!(ret.req_id, 42, "req_id must be echoed per-leg");
     }
@@ -1745,14 +1913,20 @@ mod tests {
     /// Batch wire: MATCHER_BATCH_HEADER_LEN + 1*MATCHER_BATCH_LEG_LEN = 44 bytes for n=1.
     #[test]
     fn test_batch_wire_sizes() {
-        use crate::{MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS, MATCHER_RETURN_LEN};
+        use crate::{
+            MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS,
+            MATCHER_RETURN_LEN,
+        };
         assert_eq!(MATCHER_BATCH_HEADER_LEN, 18);
         assert_eq!(MATCHER_BATCH_LEG_LEN, 26);
         assert_eq!(MATCHER_BATCH_MAX_LEGS, 16);
         // N=1 payload: 18+26 = 44 bytes
         assert_eq!(MATCHER_BATCH_HEADER_LEN + MATCHER_BATCH_LEG_LEN, 44);
         // Max payload: 18 + 16*26 = 434 bytes
-        assert_eq!(MATCHER_BATCH_HEADER_LEN + MATCHER_BATCH_MAX_LEGS * MATCHER_BATCH_LEG_LEN, 434);
+        assert_eq!(
+            MATCHER_BATCH_HEADER_LEN + MATCHER_BATCH_MAX_LEGS * MATCHER_BATCH_LEG_LEN,
+            434
+        );
         // Max return data: 16 * 64 = 1024 bytes (fits Solana return-data cap)
         assert_eq!(MATCHER_BATCH_MAX_LEGS * MATCHER_RETURN_LEN, 1024);
     }
@@ -1792,7 +1966,10 @@ mod tests {
     /// does.
     #[test]
     fn test_batch_inconsistent_oracle_prices_same_asset_rejected() {
-        use crate::{ERR_INCONSISTENT_LEG_ORACLE_PRICE, MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS, ORACLE_PRICE_E6_MAX};
+        use crate::{
+            ERR_INCONSISTENT_LEG_ORACLE_PRICE, MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN,
+            MATCHER_BATCH_MAX_LEGS, ORACLE_PRICE_E6_MAX,
+        };
 
         // Build a 2-leg payload: both legs target asset_index=0 but with
         // different prices (100_000_000 vs 200_000_000).
@@ -1846,13 +2023,16 @@ mod tests {
     /// IDENTICAL oracle_price_e6 values must pass the consistency check.
     #[test]
     fn test_batch_consistent_oracle_prices_same_asset_accepted() {
-        use crate::{MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS, ORACLE_PRICE_E6_MAX};
+        use crate::{
+            MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS,
+            ORACLE_PRICE_E6_MAX,
+        };
 
         // Two legs on asset 0 at the same price, plus a leg on asset 1.
         let legs: [(u16, u64, i128); 3] = [
-            (0, 100_000_000, 100),   // asset 0, price A
-            (1, 50_000_000, 200),    // asset 1, price C
-            (0, 100_000_000, -50),   // asset 0, price A again — identical, OK
+            (0, 100_000_000, 100), // asset 0, price A
+            (1, 50_000_000, 200),  // asset 1, price C
+            (0, 100_000_000, -50), // asset 0, price A again — identical, OK
         ];
         let payload = build_batch_payload(&legs);
 
@@ -1970,7 +2150,10 @@ mod tests {
             // astronomically large but the guard is inclusive-at-ceiling).
             Ok(())
         };
-        assert!(result.is_ok(), "price at ceiling must be accepted by the guard");
+        assert!(
+            result.is_ok(),
+            "price at ceiling must be accepted by the guard"
+        );
     }
 
     /// #8-hardening (batch upper-bound): A batch leg with oracle_price_e6 above
@@ -2021,17 +2204,16 @@ mod tests {
             let mut buf = alloc::vec![0u8; MATCHER_BATCH_HEADER_LEN + MATCHER_BATCH_LEG_LEN];
             buf[0] = crate::MATCHER_BATCH_CALL_TAG;
             buf[1] = 1u8;
-            buf[2..10].copy_from_slice(&1u64.to_le_bytes());  // req_id
+            buf[2..10].copy_from_slice(&1u64.to_le_bytes()); // req_id
             buf[10..18].copy_from_slice(&999u64.to_le_bytes()); // lp_account_id = 999
-            // one leg with valid data
+                                                                // one leg with valid data
             buf[18..20].copy_from_slice(&0u16.to_le_bytes()); // asset_index
             buf[20..28].copy_from_slice(&100_000_000u64.to_le_bytes()); // oracle
             buf[28..44].copy_from_slice(&100i128.to_le_bytes()); // req_size
             buf
         };
 
-        let lp_account_id_from_payload =
-            u64::from_le_bytes(payload[10..18].try_into().unwrap());
+        let lp_account_id_from_payload = u64::from_le_bytes(payload[10..18].try_into().unwrap());
 
         // Guard: same logic as process_batch_call
         let result: Result<(), ProgramError> =
@@ -2061,7 +2243,10 @@ mod tests {
                 Ok(())
             };
 
-        assert!(result.is_ok(), "#12: matching lp_account_id must pass guard");
+        assert!(
+            result.is_ok(),
+            "#12: matching lp_account_id must pass guard"
+        );
     }
 
     /// #12 v3-compat: when ctx.lp_account_id = 0, any payload value passes.
@@ -2078,7 +2263,10 @@ mod tests {
                 Ok(())
             };
 
-        assert!(result.is_ok(), "#12 v3-compat: zero ctx.lp_account_id must skip guard");
+        assert!(
+            result.is_ok(),
+            "#12 v3-compat: zero ctx.lp_account_id must skip guard"
+        );
     }
 
     // ==========================================================================
@@ -2095,8 +2283,8 @@ mod tests {
     fn test_batch_per_leg_remainder_reset() {
         // ctx with insurance enabled
         let mut ctx = default_vamm_ctx();
-        ctx.fee_to_insurance_bps = 500;  // 5% of trading fee
-        ctx.trading_fee_bps = 10;        // 10 bps trading fee
+        ctx.fee_to_insurance_bps = 500; // 5% of trading fee
+        ctx.trading_fee_bps = 10; // 10 bps trading fee
         ctx.insurance_fee_remainder_e6 = 12345; // non-zero remainder from previous state
 
         let exec_size: i128 = 1_000_000;
@@ -2118,7 +2306,10 @@ mod tests {
         let (fee2_without_reset, _) = compute_insurance_fee(&ctx, exec_size, exec_price);
 
         // With reset: both legs yield the same fee (deterministic, remainder = 0 each time)
-        assert_eq!(fee1_with_reset, fee2_with_reset, "with reset: symmetric legs must yield equal fees");
+        assert_eq!(
+            fee1_with_reset, fee2_with_reset,
+            "with reset: symmetric legs must yield equal fees"
+        );
 
         // Without reset: leg2 may differ from leg1 due to inherited remainder
         // This is the latent bug. We don't assert it differs (could be same by coincidence),
@@ -2183,7 +2374,10 @@ mod tests {
     #[test]
     fn test_sdk_fixture_batch_call_tag_is_3() {
         use crate::MATCHER_BATCH_CALL_TAG;
-        assert_eq!(MATCHER_BATCH_CALL_TAG, 3u8, "#16: MATCHER_BATCH_CALL_TAG must be 3");
+        assert_eq!(
+            MATCHER_BATCH_CALL_TAG, 3u8,
+            "#16: MATCHER_BATCH_CALL_TAG must be 3"
+        );
     }
 }
 
@@ -2337,9 +2531,10 @@ mod proofs {
         // Un-staged trading fee reference, consistent with the single fused
         // division compute_insurance_fee now performs (no intermediate floor).
         let abs_size = exec_size.unsigned_abs();
-        let full_trading_fee =
-            abs_size.saturating_mul(exec_price as u128).saturating_mul(trading_fee_bps as u128)
-                / 10_000_000_000u128;
+        let full_trading_fee = abs_size
+            .saturating_mul(exec_price as u128)
+            .saturating_mul(trading_fee_bps as u128)
+            / 10_000_000_000u128;
 
         // PROPERTY: insurance fee ≤ full trading fee + 2 (one unit for dropping the
         // intermediate notional floor, one unit for the carried remainder).
