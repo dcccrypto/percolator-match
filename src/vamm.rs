@@ -916,14 +916,16 @@ fn compute_vamm_execution(
 
     // impact_bps = abs_notional_e6 * impact_k_bps / liquidity_notional_e6
     let impact_k = ctx.impact_k_bps as u128;
-    let impact_bps = if ctx.liquidity_notional_e6 > 0 {
-        abs_notional_e6
-            .checked_mul(impact_k)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-            / ctx.liquidity_notional_e6
-    } else {
-        0
-    };
+    // `checked_div` rather than a `> 0` guard plus `/`: exactly equivalent, since
+    // the only way the division fails is a zero divisor and that is the case the
+    // old `else` branch mapped to 0. clippy 1.98 added `manual_checked_ops`, which
+    // flags the guarded form — and the new CI here compiles with `-D warnings`, so
+    // it surfaced on arrival even though this code predates it.
+    let impact_bps = abs_notional_e6
+        .checked_mul(impact_k)
+        .ok_or(ProgramError::ArithmeticOverflow)?
+        .checked_div(ctx.liquidity_notional_e6)
+        .unwrap_or(0);
 
     let base = ctx.base_spread_bps as u128;
     let fee = ctx.trading_fee_bps as u128;
