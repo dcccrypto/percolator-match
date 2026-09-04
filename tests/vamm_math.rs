@@ -106,11 +106,14 @@ fn vamm_exec_price(ctx: &MatcherCtx, oracle: u64, abs_size: u128, is_buy: bool) 
     let o = oracle as u128;
     let abs_notional_e6 = abs_size * o / 1_000_000;
     let impact_k = ctx.impact_k_bps as u128;
-    let impact_bps = if ctx.liquidity_notional_e6 > 0 {
-        abs_notional_e6 * impact_k / ctx.liquidity_notional_e6
-    } else {
-        0
-    };
+    // `checked_div` rather than a `> 0` guard plus `/`, matching src/vamm.rs: the
+    // only way the division fails is a zero divisor, which is the case the old
+    // `else` branch mapped to 0. clippy 1.98's `manual_checked_ops` flags the
+    // guarded form, and the new CI runs clippy with `--all-targets -D warnings`,
+    // so test files are held to the same bar as src.
+    let impact_bps = (abs_notional_e6 * impact_k)
+        .checked_div(ctx.liquidity_notional_e6)
+        .unwrap_or(0);
     let base = ctx.base_spread_bps as u128;
     let fee = ctx.trading_fee_bps as u128;
     let max_total = ctx.max_total_bps as u128;
