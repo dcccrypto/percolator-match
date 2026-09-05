@@ -828,6 +828,34 @@ fn compute_insurance_fee(ctx: &MatcherCtx, exec_size: i128, exec_price: u64) -> 
     (core::cmp::min(fee, u64::MAX as u128) as u64, remainder)
 }
 
+/// The flags a completed execution returns.
+///
+/// GH#452: `FLAG_PARTIAL_OK` used to be set ONLY on the zero-fill early return, so a
+/// NON-zero clip — `min(req_abs, ctx.max_fill_abs)`, or a partial-headroom trim by
+/// `check_inventory_limit` — came back as `FLAG_VALID` alone. That is precisely the
+/// shape the wrapper refuses:
+///
+/// ```text
+/// if ret.exec_size.unsigned_abs() < req_size.unsigned_abs()
+///     && (ret.flags & FLAG_PARTIAL_OK) == 0 { return Err(InvalidAccountData) }
+/// ```
+///
+/// so every partial fill reverted for any LP whose matcher context carried a finite
+/// `max_fill_abs` or `max_inventory_abs`. It fails closed — no fund loss — and it is
+/// latent on the deployed config, which passes `max_fill_abs = u128::MAX` and
+/// `max_inventory_abs = 0` (unlimited), making `fill_abs == req_abs` always and the
+/// old flag accidentally correct. It goes live the moment any LP sets a real cap.
+///
+/// Shared by both execution paths deliberately: the bug was two copies of the flag
+/// decision, and a third copy would just wait to drift again.
+fn execution_flags(fill_abs: u128, req_abs: u128) -> u32 {
+    if fill_abs < req_abs {
+        FLAG_VALID | FLAG_PARTIAL_OK
+    } else {
+        FLAG_VALID
+    }
+}
+
 fn compute_passive_execution(
     ctx: &MatcherCtx,
     call: &MatcherCall,
@@ -881,7 +909,11 @@ fn compute_passive_execution(
         return Err(ProgramError::ArithmeticOverflow);
     }
 
-    Ok((exec_price_u128 as u64, exec_size, FLAG_VALID))
+    Ok((
+        exec_price_u128 as u64,
+        exec_size,
+        execution_flags(fill_abs, req_abs),
+    ))
 }
 
 fn compute_vamm_execution(
@@ -960,7 +992,11 @@ fn compute_vamm_execution(
         return Err(ProgramError::ArithmeticOverflow);
     }
 
-    Ok((exec_price_u128 as u64, exec_size, FLAG_VALID))
+    Ok((
+        exec_price_u128 as u64,
+        exec_size,
+        execution_flags(fill_abs, req_abs),
+    ))
 }
 
 fn check_inventory_limit(
@@ -1165,16 +1201,94 @@ mod tests {
     fn test_partial_fill_capped() {
         let mut ctx = default_vamm_ctx();
         ctx.max_fill_abs = 500;
-        let (_, exec_size, _) = compute_execution(&ctx, &make_call(100_000_000, 1000)).unwrap();
+        let (_, exec_size, flags) = compute_execution(&ctx, &make_call(100_000_000, 1000)).unwrap();
         assert_eq!(exec_size, 500);
+        // GH#452. This test existed and passed while the bug was live, because it
+        // discarded `flags` with `_` — it asserted the clip and threw away the field
+        // that was wrong. The wrapper rejects exactly this shape without the flag.
+        assert_eq!(flags, FLAG_VALID | FLAG_PARTIAL_OK);
     }
 
     #[test]
     fn test_inventory_limit_caps_fill() {
         let mut ctx = default_vamm_ctx();
         ctx.max_inventory_abs = 100;
-        let (_, exec_size, _) = compute_execution(&ctx, &make_call(100_000_000, 1000)).unwrap();
+        let (_, exec_size, flags) = compute_execution(&ctx, &make_call(100_000_000, 1000)).unwrap();
         assert_eq!(exec_size, 100);
+        // GH#452: the inventory trim is the second route to a non-zero clip, and it
+        // was equally unflagged.
+        assert_eq!(flags, FLAG_VALID | FLAG_PARTIAL_OK);
+    }
+
+    /// GH#452 — the wrapper's acceptance rule, restated here so the matcher's own
+    /// suite fails when it would be rejected on the other side of the CPI.
+    ///
+    /// `validate_matcher_return` (percolator-prog `v16_program.rs`):
+    ///
+    /// ```text
+    /// if |exec_size| < |req_size| && (flags & FLAG_PARTIAL_OK) == 0 -> InvalidAccountData
+    /// ```
+    ///
+    /// Deliberately a hard-coded restatement rather than an import: percolator-match
+    /// does not depend on the wrapper, and a shared constant would not have caught
+    /// this anyway — both sides already agreed on what `FLAG_PARTIAL_OK` MEANS. They
+    /// disagreed on when it is set.
+    fn wrapper_would_accept(exec_size: i128, req_size: i128, flags: u32) -> bool {
+        exec_size.unsigned_abs() >= req_size.unsigned_abs() || (flags & FLAG_PARTIAL_OK) != 0
+    }
+
+    #[test]
+    fn test_every_clip_shape_is_accepted_by_the_wrapper() {
+        // Each of these produced a non-zero clip that the wrapper refused.
+        let cases: &[(&str, u128, u128, i128)] = &[
+            ("vamm max_fill", 500, 0, 1000),
+            ("vamm max_fill sell", 500, 0, -1000),
+            ("vamm inventory", u128::MAX, 100, 1000),
+            ("vamm inventory sell", u128::MAX, 100, -1000),
+        ];
+        for (name, max_fill, max_inv, req) in cases {
+            let mut ctx = default_vamm_ctx();
+            ctx.max_fill_abs = *max_fill;
+            ctx.max_inventory_abs = *max_inv;
+            let (_, exec_size, flags) =
+                compute_execution(&ctx, &make_call(100_000_000, *req)).unwrap();
+            assert!(
+                exec_size.unsigned_abs() < req.unsigned_abs(),
+                "{name}: expected a partial fill to exercise the rule"
+            );
+            assert!(
+                wrapper_would_accept(exec_size, *req, flags),
+                "{name}: wrapper would revert this fill"
+            );
+        }
+    }
+
+    #[test]
+    fn test_passive_path_flags_its_partial_fills_too() {
+        // The passive path has its own copy of the return, and had its own copy of
+        // the bug. No existing test covered a passive clip at all.
+        let mut ctx = default_passive_ctx();
+        ctx.max_fill_abs = 250;
+        let (_, exec_size, flags) = compute_execution(&ctx, &make_call(100_000_000, 1000)).unwrap();
+        assert_eq!(exec_size, 250);
+        assert_eq!(flags, FLAG_VALID | FLAG_PARTIAL_OK);
+        assert!(wrapper_would_accept(exec_size, 1000, flags));
+    }
+
+    #[test]
+    fn test_full_fill_does_not_claim_partial() {
+        // The other direction, and the reason this is a predicate rather than an
+        // unconditional flag: setting FLAG_PARTIAL_OK always would pass the wrapper
+        // check too, by making it vacuous. A full fill must not claim to be partial.
+        for ctx in [default_vamm_ctx(), default_passive_ctx()] {
+            let (_, exec_size, flags) =
+                compute_execution(&ctx, &make_call(100_000_000, 1000)).unwrap();
+            assert_eq!(exec_size, 1000);
+            assert_eq!(
+                flags, FLAG_VALID,
+                "a full fill must not set FLAG_PARTIAL_OK"
+            );
+        }
     }
 
     #[test]
