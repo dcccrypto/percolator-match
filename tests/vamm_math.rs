@@ -44,7 +44,8 @@ fn vamm_ctx(
         _new_pad: [0; 4],
         lp_account_id: 42,
         insurance_fee_remainder_e6: 0,
-        _reserved: [0; 80],
+        backing_fee_cap_bps: 0,
+        _reserved: [0; 78],
     }
 }
 
@@ -76,7 +77,8 @@ fn passive_ctx(
         _new_pad: [0; 4],
         lp_account_id: 42,
         insurance_fee_remainder_e6: 0,
-        _reserved: [0; 80],
+        backing_fee_cap_bps: 0,
+        _reserved: [0; 78],
     }
 }
 

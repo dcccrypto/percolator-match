@@ -32,6 +32,13 @@ pub const CTX_VAMM_OFFSET: usize = MATCHER_RETURN_LEN; // 64
 pub const CTX_VAMM_LEN: usize = 256;
 /// Minimum context account size
 pub const MATCHER_CONTEXT_LEN: usize = 320;
+/// sync/v16-migration-backing-fee-cap: absolute byte offset in the 320-byte matcher
+/// context account where the LP's configured `backing_fee_cap_bps` (u16 LE) lives —
+/// i.e. `CTX_VAMM_OFFSET` + the field's offset within `MatcherCtx` (176, carved from
+/// the tail of what was previously an 80-byte `_reserved` block; see `vamm::MatcherCtx`).
+/// Settable via `MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG`; read by
+/// `vamm::MatcherCtx::read_from`/`write_to`.
+pub const CTX_BACKING_FEE_CAP_OFFSET: usize = CTX_VAMM_OFFSET + 176; // 240
 
 // =============================================================================
 // Instruction Tags
@@ -43,6 +50,15 @@ pub const MATCHER_CALL_TAG: u8 = 0;
 pub const MATCHER_INIT_VAMM_TAG: u8 = 2;
 /// Batched matcher call instruction tag (atomic multi-leg CPI from percolator).
 pub const MATCHER_BATCH_CALL_TAG: u8 = 3;
+/// sync/v16-migration-backing-fee-cap: LP-settable config instruction. Sets
+/// `MatcherCtx::backing_fee_cap_bps` (0..=10_000), signed by the same `lp_pda` that
+/// signs every call/batch-call/init. Modeled on the wrapper's expectation
+/// (percolator-prog `sync/w2-e24cf78e`, "require matcher consent for CPI backing
+/// fees") that a matcher exposes a way for its LP to opt in to a nonzero
+/// backing-domain fee cap; upstream `aeyakovenko/percolator-match` has no
+/// equivalent instruction as of `60aac3a` (checked 2026-09-21 — this fork is the
+/// only implementation).
+pub const MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG: u8 = 4;
 
 // =============================================================================
 // Batched Matcher Call Layout (tag 3) - one LP fills N legs in a single CPI
@@ -74,6 +90,22 @@ pub const FLAG_VALID: u32 = 1;
 pub const FLAG_PARTIAL_OK: u32 = 2;
 pub const FLAG_REJECTED: u32 = 4;
 pub const MATCHER_ABI_VERSION: u32 = 3;
+
+/// sync/v16-migration-backing-fee-cap (adopts wrapper `sync/w2-e24cf78e`, "require
+/// matcher consent for CPI backing fees" — upstream `e24cf78e`): bits 8..21 of
+/// `flags` carry this matcher's self-declared cap (bps, 0..=10_000) on how much
+/// backing-domain fee it consents to being charged on its own (account_b) side of a
+/// CPI-filled trade. These MUST match percolator-prog's
+/// `matcher_abi::FLAG_BACKING_FEE_CAP_SHIFT`/`FLAG_BACKING_FEE_CAP_MASK` exactly
+/// (verified against `sync/integration-v16` @ `a9318945`, `src/v16_program.rs`
+/// lines 7779-7780) — the wrapper's `validate_matcher_return` rejects any `flags`
+/// bit outside `FLAG_VALID | FLAG_PARTIAL_OK | FLAG_REJECTED |
+/// FLAG_BACKING_FEE_CAP_MASK`, and reads back cap=0 (fail-closed on any nonzero
+/// backing-domain fee) from any matcher that never sets these bits.
+pub const FLAG_BACKING_FEE_CAP_SHIFT: u32 = 8;
+pub const FLAG_BACKING_FEE_CAP_MASK: u32 = 0x3fff << FLAG_BACKING_FEE_CAP_SHIFT;
+/// Upper bound the wrapper enforces on the decoded cap (100.00%).
+pub const BACKING_FEE_CAP_BPS_MAX: u16 = 10_000;
 
 // =============================================================================
 // Oracle Price Validation Constants
@@ -118,6 +150,24 @@ pub struct MatcherReturn {
 }
 
 impl MatcherReturn {
+    /// Decode the LP's self-declared backing-domain fee cap (bps) from `flags` bits
+    /// 8..21. Mirrors percolator-prog's `matcher_abi::MatcherReturn::backing_fee_cap_bps`
+    /// byte-for-byte (see `FLAG_BACKING_FEE_CAP_SHIFT`/`FLAG_BACKING_FEE_CAP_MASK`).
+    pub fn backing_fee_cap_bps(&self) -> u16 {
+        ((self.flags & FLAG_BACKING_FEE_CAP_MASK) >> FLAG_BACKING_FEE_CAP_SHIFT) as u16
+    }
+
+    /// Set bits 8..21 of `flags` to `cap_bps`, leaving every other bit untouched.
+    /// The write is masked to `FLAG_BACKING_FEE_CAP_MASK` regardless of the input,
+    /// so this can never set a bit outside the wrapper's `KNOWN_FLAGS` — the caller
+    /// is still responsible for keeping `cap_bps <= BACKING_FEE_CAP_BPS_MAX`
+    /// (`MatcherCtx::validate` enforces this on the stored config value).
+    pub fn with_backing_fee_cap_bps(mut self, cap_bps: u16) -> Self {
+        self.flags = (self.flags & !FLAG_BACKING_FEE_CAP_MASK)
+            | (((cap_bps as u32) << FLAG_BACKING_FEE_CAP_SHIFT) & FLAG_BACKING_FEE_CAP_MASK);
+        self
+    }
+
     pub fn write_to(&self, data: &mut [u8]) -> Result<(), ProgramError> {
         if data.len() < MATCHER_RETURN_LEN {
             return Err(ProgramError::AccountDataTooSmall);
@@ -254,6 +304,9 @@ pub fn process_instruction(
             process_batch_matcher_call(program_id, accounts, instruction_data)
         }
         MATCHER_INIT_VAMM_TAG => vamm::process_init(program_id, accounts, instruction_data),
+        MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG => {
+            vamm::process_configure_backing_fee_cap(program_id, accounts, instruction_data)
+        }
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }

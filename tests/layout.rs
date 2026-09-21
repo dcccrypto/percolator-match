@@ -7,12 +7,14 @@
 //! documented offset and the real runtime offset so they can't drift apart.
 
 use percolator_match::vamm::{
-    InitParams, MatcherCtx, INIT_CTX_LEN, MATCHER_MAGIC, MATCHER_VERSION,
+    ConfigureBackingFeeCapParams, InitParams, MatcherCtx, CONFIGURE_BACKING_FEE_CAP_LEN,
+    INIT_CTX_LEN, MATCHER_MAGIC, MATCHER_VERSION,
 };
 use percolator_match::{
-    MatcherCall, MatcherReturn, CTX_RETURN_OFFSET, CTX_VAMM_LEN, CTX_VAMM_OFFSET,
+    MatcherCall, MatcherReturn, BACKING_FEE_CAP_BPS_MAX, CTX_BACKING_FEE_CAP_OFFSET,
+    CTX_RETURN_OFFSET, CTX_VAMM_LEN, CTX_VAMM_OFFSET, FLAG_VALID, MATCHER_ABI_VERSION,
     MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS, MATCHER_CALL_LEN,
-    MATCHER_CONTEXT_LEN, MATCHER_RETURN_LEN,
+    MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG, MATCHER_CONTEXT_LEN, MATCHER_RETURN_LEN,
 };
 
 // ---------------------------------------------------------------------------
@@ -46,6 +48,19 @@ fn matcher_context_len_is_320() {
     // Total context account: 64 (return) + 256 (MatcherCtx) = 320
     assert_eq!(MATCHER_CONTEXT_LEN, 320);
     assert_eq!(CTX_RETURN_OFFSET + MATCHER_RETURN_LEN + CTX_VAMM_LEN, 320);
+}
+
+#[test]
+fn ctx_backing_fee_cap_offset_is_240() {
+    // sync/v16-migration-backing-fee-cap: absolute account-level offset of
+    // backing_fee_cap_bps = CTX_VAMM_OFFSET (64) + in-struct offset (176) = 240.
+    assert_eq!(CTX_BACKING_FEE_CAP_OFFSET, 240);
+    assert_eq!(CTX_BACKING_FEE_CAP_OFFSET, CTX_VAMM_OFFSET + 176);
+}
+
+#[test]
+fn backing_fee_cap_bps_max_is_10000() {
+    assert_eq!(BACKING_FEE_CAP_BPS_MAX, 10_000);
 }
 
 #[test]
@@ -227,7 +242,8 @@ fn matcher_ctx_field_offsets_via_serialization() {
         _new_pad: [0u8; 4],
         lp_account_id: 0xCAFE_BABE_1234_5678u64,
         insurance_fee_remainder_e6: 0x5566_7788_99AA_BBCCu64,
-        _reserved: [0u8; 80],
+        backing_fee_cap_bps: 0x9ABC,
+        _reserved: [0u8; 78],
     };
 
     let mut buf = [0u8; 256];
@@ -326,8 +342,13 @@ fn matcher_ctx_field_offsets_via_serialization() {
         u64::from_le_bytes(buf[168..176].try_into().unwrap()),
         ctx.insurance_fee_remainder_e6
     );
-    // _reserved at 176..256 — zeros
-    assert_eq!(&buf[176..256], &[0u8; 80]);
+    // backing_fee_cap_bps at 176..178 (sync/v16-migration-backing-fee-cap)
+    assert_eq!(
+        u16::from_le_bytes(buf[176..178].try_into().unwrap()),
+        ctx.backing_fee_cap_bps
+    );
+    // _reserved at 178..256 (78 bytes) — zeros
+    assert_eq!(&buf[178..256], &[0u8; 78]);
 }
 
 // ---------------------------------------------------------------------------
@@ -458,5 +479,288 @@ fn init_ctx_len_rust_side_includes_lp_account_id() {
     assert_eq!(
         INIT_CTX_LEN, 78,
         "Rust INIT_CTX_LEN must be 78 (includes lp_account_id)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// sync/v16-migration-backing-fee-cap
+// ---------------------------------------------------------------------------
+
+#[test]
+fn configure_backing_fee_cap_params_field_offsets() {
+    let params = ConfigureBackingFeeCapParams {
+        backing_fee_cap_bps: 0x1234,
+    };
+    let buf = params.encode();
+    assert_eq!(buf.len(), CONFIGURE_BACKING_FEE_CAP_LEN);
+    assert_eq!(buf.len(), 3, "tag(1) + backing_fee_cap_bps u16(2) = 3");
+    // tag at 0
+    assert_eq!(buf[0], MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG);
+    // backing_fee_cap_bps at 1..3
+    assert_eq!(u16::from_le_bytes(buf[1..3].try_into().unwrap()), 0x1234);
+
+    let decoded = ConfigureBackingFeeCapParams::parse(&buf).unwrap();
+    assert_eq!(decoded.backing_fee_cap_bps, 0x1234);
+}
+
+/// Wrapper decode/validate mirror, hand-transcribed from percolator-prog
+/// `sync/integration-v16` @ `a9318945`, `src/v16_program.rs`'s `matcher_abi` module
+/// (lines ~7762-7860: `FLAG_VALID`/`FLAG_PARTIAL_OK`/`FLAG_REJECTED`,
+/// `FLAG_BACKING_FEE_CAP_SHIFT`/`_MASK`, `MatcherReturn::backing_fee_cap_bps`,
+/// `read_matcher_return`, `validate_matcher_return`).
+///
+/// This is intentionally NOT a crate dependency on percolator-prog — this repo
+/// stays isolated from the wrapper (see the migration's isolation requirements).
+/// It exists so this suite can assert the exact byte-for-byte contract the
+/// wrapper enforces, not just percolator-match decoding its own encoding. If
+/// percolator-prog's `matcher_abi` module changes, this mirror (and everything
+/// below that uses it) must be updated to match, or it silently stops proving
+/// anything against the real wrapper.
+mod wrapper_mirror {
+    pub const FLAG_VALID: u32 = 1;
+    pub const FLAG_PARTIAL_OK: u32 = 2;
+    pub const FLAG_REJECTED: u32 = 4;
+    pub const FLAG_BACKING_FEE_CAP_SHIFT: u32 = 8;
+    pub const FLAG_BACKING_FEE_CAP_MASK: u32 = 0x3fff << FLAG_BACKING_FEE_CAP_SHIFT;
+    pub const MATCHER_ABI_VERSION: u32 = 3;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MatcherReturn {
+        pub abi_version: u32,
+        pub flags: u32,
+        pub exec_price_e6: u64,
+        pub exec_size: i128,
+        pub req_id: u64,
+        pub lp_account_id: u64,
+        pub oracle_price_e6: u64,
+        pub asset_index: u64,
+    }
+
+    impl MatcherReturn {
+        pub fn backing_fee_cap_bps(&self) -> u16 {
+            ((self.flags & FLAG_BACKING_FEE_CAP_MASK) >> FLAG_BACKING_FEE_CAP_SHIFT) as u16
+        }
+    }
+
+    pub fn read_matcher_return(ctx: &[u8]) -> Result<MatcherReturn, &'static str> {
+        if ctx.len() < 64 {
+            return Err("InvalidAccountData: ctx shorter than 64 bytes");
+        }
+        Ok(MatcherReturn {
+            abi_version: u32::from_le_bytes(ctx[0..4].try_into().unwrap()),
+            flags: u32::from_le_bytes(ctx[4..8].try_into().unwrap()),
+            exec_price_e6: u64::from_le_bytes(ctx[8..16].try_into().unwrap()),
+            exec_size: i128::from_le_bytes(ctx[16..32].try_into().unwrap()),
+            req_id: u64::from_le_bytes(ctx[32..40].try_into().unwrap()),
+            lp_account_id: u64::from_le_bytes(ctx[40..48].try_into().unwrap()),
+            oracle_price_e6: u64::from_le_bytes(ctx[48..56].try_into().unwrap()),
+            asset_index: u64::from_le_bytes(ctx[56..64].try_into().unwrap()),
+        })
+    }
+
+    pub fn validate_matcher_return(
+        ret: &MatcherReturn,
+        lp_account_id: u64,
+        asset_index: u16,
+        oracle_price_e6: u64,
+        req_size: i128,
+        req_id: u64,
+    ) -> Result<(), &'static str> {
+        if ret.abi_version != MATCHER_ABI_VERSION {
+            return Err("InvalidAccountData: bad abi_version");
+        }
+        const KNOWN_FLAGS: u32 =
+            FLAG_VALID | FLAG_PARTIAL_OK | FLAG_REJECTED | FLAG_BACKING_FEE_CAP_MASK;
+        if (ret.flags & !KNOWN_FLAGS) != 0
+            || (ret.flags & FLAG_VALID) == 0
+            || (ret.flags & FLAG_REJECTED) != 0
+            || ret.backing_fee_cap_bps() > 10_000
+        {
+            return Err("InvalidAccountData: bad flags");
+        }
+        if ret.lp_account_id != lp_account_id
+            || ret.oracle_price_e6 != oracle_price_e6
+            || ret.asset_index != asset_index as u64
+            || ret.req_id != req_id
+            || ret.exec_price_e6 == 0
+        {
+            return Err("InvalidAccountData: mismatched echo fields");
+        }
+        if ret.exec_size == 0 {
+            if (ret.flags & FLAG_PARTIAL_OK) == 0 || ret.exec_price_e6 != oracle_price_e6 {
+                return Err("InvalidAccountData: bad zero-fill");
+            }
+            return Ok(());
+        }
+        if ret.exec_size == i128::MIN || req_size == i128::MIN || req_size == 0 {
+            return Err("InvalidAccountData: bad exec_size/req_size");
+        }
+        if ret.exec_size.signum() != req_size.signum() {
+            return Err("InvalidAccountData: sign mismatch");
+        }
+        if ret.exec_size.unsigned_abs() > req_size.unsigned_abs() {
+            return Err("InvalidAccountData: overfill");
+        }
+        if ret.exec_size.unsigned_abs() < req_size.unsigned_abs()
+            && (ret.flags & FLAG_PARTIAL_OK) == 0
+        {
+            return Err("InvalidAccountData: partial fill without FLAG_PARTIAL_OK");
+        }
+        Ok(())
+    }
+}
+
+/// Round-trip: percolator-match encodes a cap via the real
+/// `MatcherReturn::with_backing_fee_cap_bps`, and the wrapper's exact decode
+/// (`wrapper_mirror`, transcribed from a9318945) must read back the same bps —
+/// for the full valid range, including the boundary value 10_000.
+///
+/// Also a byte-layout negative control: the raw `flags` assertion below compares
+/// against `FLAG_VALID | (cap << 8)` computed independently of the crate's own
+/// shift/mask constants, so it fails if percolator-match's encoder ever used a
+/// different shift or mask than the wrapper's `FLAG_BACKING_FEE_CAP_SHIFT`/`_MASK`.
+#[test]
+fn backing_fee_cap_round_trip_matches_wrapper_decode() {
+    for cap in [0u16, 1, 250, 5000, 9999, BACKING_FEE_CAP_BPS_MAX] {
+        let ret = MatcherReturn {
+            abi_version: MATCHER_ABI_VERSION,
+            flags: FLAG_VALID,
+            exec_price_e6: 100_000_000,
+            exec_size: 1000,
+            req_id: 7,
+            lp_account_id: 42,
+            oracle_price_e6: 99_000_000,
+            asset_index: 3,
+        }
+        .with_backing_fee_cap_bps(cap);
+
+        assert_eq!(
+            ret.flags,
+            FLAG_VALID | ((cap as u32) << 8),
+            "cap {cap} must land exactly at flags bits 8..21, nowhere else"
+        );
+
+        let mut buf = [0u8; 64];
+        ret.write_to(&mut buf).unwrap();
+
+        let decoded = wrapper_mirror::read_matcher_return(&buf).unwrap();
+        assert_eq!(
+            decoded.backing_fee_cap_bps(),
+            cap,
+            "wrapper decode of cap {cap} must round-trip exactly"
+        );
+        assert!(
+            wrapper_mirror::validate_matcher_return(&decoded, 42, 3, 99_000_000, 1000, 7)
+                .is_ok(),
+            "wrapper must accept a well-formed return for any in-range cap ({cap})"
+        );
+    }
+}
+
+/// Negative control: a MatcherReturn built WITHOUT calling
+/// `.with_backing_fee_cap_bps` (e.g. a future refactor that forgets it) must
+/// decode as cap=0 under the wrapper's real bit layout — proving the fail-closed
+/// behavior the wrapper relies on, and demonstrating exactly the "cap bits
+/// dropped" failure mode this test suite guards against.
+#[test]
+fn negative_control_missing_with_backing_fee_cap_bps_decodes_as_zero() {
+    let ret_without_cap = MatcherReturn {
+        abi_version: MATCHER_ABI_VERSION,
+        flags: FLAG_VALID, // no .with_backing_fee_cap_bps(..) call
+        exec_price_e6: 100_000_000,
+        exec_size: 1000,
+        req_id: 7,
+        lp_account_id: 42,
+        oracle_price_e6: 99_000_000,
+        asset_index: 3,
+    };
+    let mut buf = [0u8; 64];
+    ret_without_cap.write_to(&mut buf).unwrap();
+    let decoded = wrapper_mirror::read_matcher_return(&buf).unwrap();
+    assert_eq!(
+        decoded.backing_fee_cap_bps(),
+        0,
+        "omitting with_backing_fee_cap_bps must decode as cap=0 (fail-closed) — \
+         this is exactly why every process_call/process_batch_call return MUST \
+         end in .with_backing_fee_cap_bps(ctx.backing_fee_cap_bps)"
+    );
+}
+
+/// The wrapper must reject a decoded cap above 10_000 bps, even though
+/// percolator-match's own `MatcherCtx::validate`/`process_configure_backing_fee_cap`
+/// never let such a value be stored in the first place (defense in depth: this
+/// pins the wrapper's independent bound so a future bug in either side is still
+/// caught by the other).
+#[test]
+fn wrapper_validate_rejects_cap_over_10000_bps() {
+    let ret = MatcherReturn {
+        abi_version: MATCHER_ABI_VERSION,
+        flags: FLAG_VALID,
+        exec_price_e6: 100_000_000,
+        exec_size: 1000,
+        req_id: 7,
+        lp_account_id: 42,
+        oracle_price_e6: 99_000_000,
+        asset_index: 3,
+    }
+    .with_backing_fee_cap_bps(10_001); // 10_001 < 0x3fff, so it round-trips exactly
+
+    let mut buf = [0u8; 64];
+    ret.write_to(&mut buf).unwrap();
+    let decoded = wrapper_mirror::read_matcher_return(&buf).unwrap();
+    assert_eq!(decoded.backing_fee_cap_bps(), 10_001);
+    assert!(
+        wrapper_mirror::validate_matcher_return(&decoded, 42, 3, 99_000_000, 1000, 7).is_err(),
+        "wrapper must reject a decoded cap > 10_000 bps"
+    );
+}
+
+/// The wrapper must reject any `flags` bit outside `KNOWN_FLAGS` (`FLAG_VALID |
+/// FLAG_PARTIAL_OK | FLAG_REJECTED | FLAG_BACKING_FEE_CAP_MASK`) — this is the
+/// guard that keeps a future 15th "cap" bit, or any other stray bit, from
+/// silently reaching the wrapper.
+#[test]
+fn wrapper_validate_rejects_unknown_flag_bit() {
+    let ret = MatcherReturn {
+        abi_version: MATCHER_ABI_VERSION,
+        flags: FLAG_VALID | (1 << 30), // bit 30: outside VALID/PARTIAL_OK/REJECTED/CAP_MASK
+        exec_price_e6: 100_000_000,
+        exec_size: 1000,
+        req_id: 7,
+        lp_account_id: 42,
+        oracle_price_e6: 99_000_000,
+        asset_index: 3,
+    };
+    let mut buf = [0u8; 64];
+    ret.write_to(&mut buf).unwrap();
+    let decoded = wrapper_mirror::read_matcher_return(&buf).unwrap();
+    assert!(
+        wrapper_mirror::validate_matcher_return(&decoded, 42, 3, 99_000_000, 1000, 7).is_err(),
+        "wrapper must reject any flags bit outside KNOWN_FLAGS"
+    );
+}
+
+/// Positive control for the two rejection tests above: the SAME well-formed
+/// return (in-range cap, no stray bits) must be accepted, so the rejections
+/// above are proven to be about the specific bad field, not a broken harness.
+#[test]
+fn wrapper_validate_accepts_well_formed_return_with_max_cap() {
+    let ret = MatcherReturn {
+        abi_version: MATCHER_ABI_VERSION,
+        flags: FLAG_VALID,
+        exec_price_e6: 100_000_000,
+        exec_size: 1000,
+        req_id: 7,
+        lp_account_id: 42,
+        oracle_price_e6: 99_000_000,
+        asset_index: 3,
+    }
+    .with_backing_fee_cap_bps(BACKING_FEE_CAP_BPS_MAX);
+
+    let mut buf = [0u8; 64];
+    ret.write_to(&mut buf).unwrap();
+    let decoded = wrapper_mirror::read_matcher_return(&buf).unwrap();
+    assert!(
+        wrapper_mirror::validate_matcher_return(&decoded, 42, 3, 99_000_000, 1000, 7).is_ok()
     );
 }
