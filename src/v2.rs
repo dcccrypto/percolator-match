@@ -53,16 +53,29 @@ pub const EXT_FLAG_MARK_SLOT: u8 = 1 << 1;
 /// charge it. Without this bit the matcher never sets those bits, so a wrapper whose
 /// `validate_matcher_return` rejects unknown flag bits (v18.2) is never broken.
 pub const EXT_FLAG_ACCEPTS_FEE_REQUEST: u8 = 1 << 2;
-const EXT_KNOWN_FLAGS: u8 = EXT_FLAG_HEADROOM | EXT_FLAG_MARK_SLOT | EXT_FLAG_ACCEPTS_FEE_REQUEST;
+/// The wrapper asserts this request only REDUCES the taker's existing position (never
+/// opens or flips it). Lets a taker exit under a stale mark when the ctx allows reducing
+/// fills (security review P2-1: exits must not be trapped by the stale guard). The matcher
+/// cannot see the taker's position, so only the wrapper can make this claim.
+pub const EXT_FLAG_TAKER_REDUCING: u8 = 1 << 3;
+/// Bytes 2..4 carry `exec_band_bps`: the wrapper's oracle band on exec_price (P1 default
+/// 500). The matcher prices within `min(max_total_bps, band)` so a banded wrapper gets a
+/// clipped fill instead of reverting (security review P2-2 / P1 Custom(66)).
+pub const EXT_FLAG_EXEC_BAND: u8 = 1 << 4;
+const EXT_KNOWN_FLAGS: u8 = EXT_FLAG_HEADROOM
+    | EXT_FLAG_MARK_SLOT
+    | EXT_FLAG_ACCEPTS_FEE_REQUEST
+    | EXT_FLAG_TAKER_REDUCING
+    | EXT_FLAG_EXEC_BAND;
 
 /// Parsed call extension.
 ///
 /// Wire (offsets relative to the start of the 24-byte block; absolute call offset = +43):
 /// ```text
 /// 0      u8   ext_version   (0 = legacy: all 24 bytes must be zero; 1 = this layout)
-/// 1      u8   ext_flags     (bit0 HEADROOM, bit1 MARK_SLOT, bit2 ACCEPTS_FEE_REQUEST;
-///                           other bits must be 0)
-/// 2..4   u16  reserved      (must be 0)
+/// 1      u8   ext_flags     (bit0 HEADROOM, bit1 MARK_SLOT, bit2 ACCEPTS_FEE_REQUEST,
+///                           bit3 TAKER_REDUCING, bit4 EXEC_BAND; other bits must be 0)
+/// 2..4   u16  exec_band_bps (must be 0 unless EXEC_BAND set)
 /// 4..12  u64  mark_slot     slot of the last fresh oracle observation behind
 ///                           oracle_price_e6 (must be 0 unless MARK_SLOT set)
 /// 12..20 u64  lp_headroom_q max |exec_size| the wrapper will accept in the direction
@@ -75,6 +88,8 @@ pub struct CallExt {
     pub headroom_q: Option<u64>,
     pub mark_slot: Option<u64>,
     pub accepts_fee_request: bool,
+    pub taker_reducing: bool,
+    pub exec_band_bps: Option<u16>,
 }
 
 impl CallExt {
@@ -91,7 +106,11 @@ impl CallExt {
             }
             CALL_EXT_VERSION_V1 => {
                 let flags = b[1];
-                if flags & !EXT_KNOWN_FLAGS != 0 || b[2] != 0 || b[3] != 0 {
+                if flags & !EXT_KNOWN_FLAGS != 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let band = u16::from_le_bytes([b[2], b[3]]);
+                if flags & EXT_FLAG_EXEC_BAND == 0 && band != 0 {
                     return Err(ProgramError::InvalidInstructionData);
                 }
                 if b[20..24].iter().any(|&x| x != 0) {
@@ -109,6 +128,8 @@ impl CallExt {
                     headroom_q: (flags & EXT_FLAG_HEADROOM != 0).then_some(headroom),
                     mark_slot: (flags & EXT_FLAG_MARK_SLOT != 0).then_some(mark_slot),
                     accepts_fee_request: flags & EXT_FLAG_ACCEPTS_FEE_REQUEST != 0,
+                    taker_reducing: flags & EXT_FLAG_TAKER_REDUCING != 0,
+                    exec_band_bps: (flags & EXT_FLAG_EXEC_BAND != 0).then_some(band),
                 })
             }
             _ => Err(ProgramError::InvalidInstructionData),
@@ -116,7 +137,11 @@ impl CallExt {
     }
 
     pub fn is_legacy(&self) -> bool {
-        self.headroom_q.is_none() && self.mark_slot.is_none() && !self.accepts_fee_request
+        self.headroom_q.is_none()
+            && self.mark_slot.is_none()
+            && !self.accepts_fee_request
+            && !self.taker_reducing
+            && self.exec_band_bps.is_none()
     }
 
     pub fn encode(&self) -> [u8; CALL_EXT_LEN] {
@@ -136,6 +161,13 @@ impl CallExt {
         }
         if self.accepts_fee_request {
             flags |= EXT_FLAG_ACCEPTS_FEE_REQUEST;
+        }
+        if self.taker_reducing {
+            flags |= EXT_FLAG_TAKER_REDUCING;
+        }
+        if let Some(band) = self.exec_band_bps {
+            flags |= EXT_FLAG_EXEC_BAND;
+            b[2..4].copy_from_slice(&band.to_le_bytes());
         }
         b[1] = flags;
         b
@@ -339,7 +371,12 @@ pub const DEFAULT_VOL_MOVE_CAP_10BPS: u8 = 100; // 1000 bps
 pub const DEFAULT_VOL_REF_SLOTS: u16 = 25; // ~10 s at 400 ms slots
 pub const DEFAULT_SKEW_CAP_BPS: u16 = 300;
 pub const DEFAULT_MAX_MARK_AGE_SLOTS: u16 = 150; // ~60 s
-pub const DEFAULT_OBSERVED_STALE_SLOTS: u16 = 1500; // ~10 min of an unchanged price
+/// OFF by default (security review P2-1): an unchanged AUTH_MARK price is normal (the
+/// keeper's #125 hold republishes the same mark; coarse e6 ticks sit flat), so the
+/// heuristic misfires on healthy markets. Use the wrapper's mark_slot instead.
+pub const DEFAULT_OBSERVED_STALE_SLOTS: u16 = 0;
+/// Reducing fills stay allowed under a stale mark by default (P2-1: exits must not trap).
+pub const DEFAULT_V2_FLAGS: u8 = V2_FLAG_STALE_ALLOW_REDUCING;
 
 /// Upper bounds enforced by [`validate_config`].
 pub const MAX_FEE_BPS: u16 = 1000;
@@ -434,7 +471,7 @@ pub fn default_config_for_kind2(
         max_inventory_abs as u64
     };
     V2Config {
-        flags: 0,
+        flags: DEFAULT_V2_FLAGS,
         fee_lo_bps: fee_lo,
         fee_hi_bps: fee_hi,
         fee_cold_bps: fee_cold,

@@ -158,8 +158,8 @@ proptest! {
 
     #[test]
     fn ext_roundtrip(h in proptest::option::of(any::<u64>()), m in proptest::option::of(any::<u64>()),
-                     fr in any::<bool>()) {
-        let e = CallExt { headroom_q: h, mark_slot: m, accepts_fee_request: fr };
+                     fr in any::<bool>(), tr in any::<bool>(), band in proptest::option::of(any::<u16>())) {
+        let e = CallExt { headroom_q: h, mark_slot: m, accepts_fee_request: fr, taker_reducing: tr, exec_band_bps: band };
         prop_assert_eq!(CallExt::parse(&e.encode()).unwrap(), e);
     }
 

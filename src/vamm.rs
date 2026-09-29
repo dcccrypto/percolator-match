@@ -850,6 +850,11 @@ pub fn execute_leg(
     // Effective limits for this leg (headroom and stale-reducing clips go here, so the
     // unmodified v1 pricing functions see them as an ordinary max_fill_abs).
     let mut eff = *ctx;
+    if let Some(band) = ext.exec_band_bps {
+        // Price inside the wrapper's exec band (P1): kinds 0/1 clamp their spread at
+        // max_total; kind 2 clips size to stay within it.
+        eff.max_total_bps = eff.max_total_bps.min(band as u32);
+    }
     if let Some(h) = ext.headroom_q {
         let rem = (h as u128).saturating_sub(headroom_used);
         if eff.max_fill_abs > rem {
@@ -876,10 +881,14 @@ pub fn execute_leg(
                 return Err(ProgramError::Custom(v2::ERR_MARK_SLOT_IN_FUTURE));
             }
             MarkState::Stale => {
+                let allow = b.cfg.flags & v2::V2_FLAG_STALE_ALLOW_REDUCING != 0;
                 // Buy from user => LP sells => inventory decreases.
                 let inv = ctx.inventory_base;
-                let reduces = (is_buy && inv > 0) || (!is_buy && inv < 0);
-                if b.cfg.flags & v2::V2_FLAG_STALE_ALLOW_REDUCING != 0 && reduces {
+                let lp_reduces = (is_buy && inv > 0) || (!is_buy && inv < 0);
+                if allow && ext.taker_reducing {
+                    // Wrapper-attested exit of the taker's own position: let it through
+                    // unclipped (the wrapper bounds it by the taker's position).
+                } else if allow && lp_reduces {
                     let cap = inv.unsigned_abs();
                     if eff.max_fill_abs > cap {
                         eff.max_fill_abs = cap;

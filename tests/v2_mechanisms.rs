@@ -132,6 +132,8 @@ fn ext_roundtrip_and_legacy() {
         headroom_q: Some(123),
         mark_slot: Some(456),
         accepts_fee_request: true,
+        taker_reducing: true,
+        exec_band_bps: Some(500),
     };
     assert_eq!(CallExt::parse(&e.encode()).unwrap(), e);
     assert_eq!(CallExt::parse(&[0u8; 24]).unwrap(), CallExt::default());
@@ -147,11 +149,17 @@ fn neg_ext_malformed_rejected() {
     b[0] = 2;
     assert!(CallExt::parse(&b).is_err(), "unknown version");
     let mut b = good;
-    b[1] |= 0x08;
-    assert!(CallExt::parse(&b).is_err(), "unknown flag bit 3");
+    b[1] |= 0x20; // bits 0..4 are assigned; 5..7 must be rejected
+    assert!(CallExt::parse(&b).is_err(), "unknown flag bit 5");
+    let mut b = good;
+    b[1] |= 0x80;
+    assert!(CallExt::parse(&b).is_err(), "unknown flag bit 7");
     let mut b = good;
     b[2] = 1;
-    assert!(CallExt::parse(&b).is_err(), "reserved 2..4");
+    assert!(
+        CallExt::parse(&b).is_err(),
+        "band bytes without EXEC_BAND flag"
+    );
     let mut b = good;
     b[23] = 1;
     assert!(CallExt::parse(&b).is_err(), "reserved 20..24");
@@ -1046,3 +1054,89 @@ fn defaults_are_valid_across_core_params() {
 
 #[allow(dead_code)]
 fn _uses(_: v2::MarkState) {}
+
+// -----------------------------------------------------------------------------
+// Security review P2-1 / P2-2 fixes
+// -----------------------------------------------------------------------------
+
+#[test]
+fn defaults_do_not_trap_exits() {
+    let d = default_config_for_kind2(10, 50, 200, 50, 4_000);
+    assert_eq!(d.observed_stale_slots, 0, "P2-1: heuristic off by default");
+    assert_eq!(
+        d.flags & V2_FLAG_STALE_ALLOW_REDUCING,
+        V2_FLAG_STALE_ALLOW_REDUCING
+    );
+}
+
+#[test]
+fn taker_reducing_exits_under_stale_mark_and_controls() {
+    let now = 9_000;
+    let stale = |taker_reducing: bool| CallExt {
+        mark_slot: Some(0),
+        taker_reducing,
+        ..CallExt::default()
+    };
+    // LP flat: an LP-reducing clip would give 0, so only the taker attestation can help.
+    let allow = kind1_guarded(10, 0, V2_FLAG_STALE_ALLOW_REDUCING);
+    let mut c = allow;
+    let out = leg(&mut c, &call(PX, -300), &stale(true), now).unwrap();
+    assert_eq!(out.exec_size, -300, "attested exit fills in full");
+    // control: same trade without the attestation is refused
+    let mut c = allow;
+    assert_eq!(
+        leg(&mut c, &call(PX, -300), &stale(false), now).unwrap_err(),
+        ProgramError::Custom(ERR_STALE_MARK)
+    );
+    // control: attestation without the ctx allowing reducing fills is refused
+    let mut c = kind1_guarded(10, 0, 0);
+    assert_eq!(
+        leg(&mut c, &call(PX, -300), &stale(true), now).unwrap_err(),
+        ProgramError::Custom(ERR_STALE_MARK)
+    );
+}
+
+#[test]
+fn exec_band_bounds_quote_and_control() {
+    let band = |b: u16| CallExt {
+        exec_band_bps: Some(b),
+        ..CallExt::default()
+    };
+    // kind 2 with deep CP impact: without a band the size clip allows up to max_total 400
+    let mut k2 = kind2_plain(30);
+    k2.impact_k_bps = 10_000;
+    k2.liquidity_notional_e6 = 1_000_000_000;
+    k2.validate().unwrap();
+    let req = 10_000_000i128;
+    let free = execute_leg(
+        &mut k2.clone(),
+        &call(PX, req),
+        &CallExt::default(),
+        Some(1),
+        0,
+    )
+    .unwrap();
+    let banded = execute_leg(&mut k2.clone(), &call(PX, req), &band(100), Some(1), 0).unwrap();
+    let bps = |p: u64| (p as u128 - PX as u128) * 10_000 / PX as u128;
+    assert!(
+        bps(free.exec_price_e6) > 100,
+        "control: unbanded quote exceeds 100 bps"
+    );
+    assert!(
+        bps(banded.exec_price_e6) <= 100,
+        "banded quote stays inside the band"
+    );
+    assert!(
+        banded.exec_size < free.exec_size,
+        "band binds by clipping size"
+    );
+    assert_eq!(banded.flags & FLAG_PARTIAL_OK, FLAG_PARTIAL_OK);
+    // kind 1: the spread clamps at the band
+    let mut k1 = core_ctx(1);
+    k1.skew_spread_mult_bps = 10_000;
+    k1.inventory_base = -1_000_000_000;
+    let wide = execute_leg(&mut k1.clone(), &call(PX, 10), &CallExt::default(), None, 0).unwrap();
+    let narrow = execute_leg(&mut k1.clone(), &call(PX, 10), &band(50), None, 0).unwrap();
+    assert!(bps(wide.exec_price_e6) > 50);
+    assert!(bps(narrow.exec_price_e6) <= 50);
+}
