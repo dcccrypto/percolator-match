@@ -354,22 +354,24 @@ impl V2Block {
 }
 
 // =============================================================================
-// Conservative defaults (backtest-derived; see backtest/ and the P2 ledger note).
+// Defaults = backtest 'V2-tuned-A': best worst-case LP PnL under Mode A (v18.2 mark
+// settlement), in- and out-of-sample (backtest/RESULTS.md). Pair with core params
+// max_total 100, impact_k 5000, liquidity = 10x LP capital, skew_spread_mult 300.
 // Only used when a kind-2 context is created through the fixed 78-byte tag-2 payload
 // (wrapper tag 83), which has no room for v2 config. Every value is re-settable by
 // tag 5. NOT calibrated on live Percolator flow — see the ledger note.
 // =============================================================================
 
-pub const DEFAULT_FEE_LO_BPS: u16 = 30;
-pub const DEFAULT_FEE_HI_BPS: u16 = 150;
-pub const DEFAULT_FEE_COLD_BPS: u16 = 80;
+pub const DEFAULT_FEE_LO_BPS: u16 = 10;
+pub const DEFAULT_FEE_HI_BPS: u16 = 80;
+pub const DEFAULT_FEE_COLD_BPS: u16 = 10;
 pub const DEFAULT_VOL_A_MILLI: u16 = 1000;
-pub const DEFAULT_VOL_B_DEN: u16 = 200;
+pub const DEFAULT_VOL_B_DEN: u16 = 100;
 pub const DEFAULT_VOL_ALPHA_BPS: u16 = 1000;
 pub const DEFAULT_VOL_WARMUP: u8 = 8;
 pub const DEFAULT_VOL_MOVE_CAP_10BPS: u8 = 100; // 1000 bps
 pub const DEFAULT_VOL_REF_SLOTS: u16 = 25; // ~10 s at 400 ms slots
-pub const DEFAULT_SKEW_CAP_BPS: u16 = 300;
+pub const DEFAULT_SKEW_CAP_BPS: u16 = 100;
 pub const DEFAULT_MAX_MARK_AGE_SLOTS: u16 = 150; // ~60 s
 /// OFF by default (security review P2-1): an unchanged AUTH_MARK price is normal (the
 /// keeper's #125 hold republishes the same mark; coarse e6 ticks sit flat), so the
@@ -731,60 +733,79 @@ pub struct AdaptiveQuoteIn {
 /// handed large trades a free option). `fill == 0` means zero-fill.
 pub fn quote_adaptive(q: &AdaptiveQuoteIn) -> Option<(u128, u64, u128)> {
     let max_total = (q.max_total_bps as u128).min(9_000);
-    let base = q.base_spread_bps as u128;
-    let lp_sells = q.taker_buys;
-    let mut fill = q.fill;
+    if q.fill == 0 {
+        return Some((0, q.oracle_e6, 0));
+    }
+    // Largest feasible fill f* = max{ f : gross_pos(f) <= max_total }, where gross_pos
+    // counts the surcharge only (a rebate never loosens the size limit). gross_pos is
+    // non-decreasing in f (impact and surcharge both are), so the feasible set is a prefix
+    // [0, f*] independent of the request and fill = min(request, f*) is monotone in the
+    // requested size. (The earlier version sized the impact budget with the skew at the
+    // REQUESTED size, so a larger request could shrink the fill — P2 backtest `-- probe`.)
+    let fill = if gross_pos_bps(q, q.fill)? <= max_total {
+        q.fill
+    } else {
+        // Invariant: gross_pos(lo) <= max (lo = 0 trivially), gross_pos(hi) > max.
+        let mut lo: u128 = 0;
+        let mut hi: u128 = q.fill;
+        let mut i = 0;
+        while hi - lo > 1 && i < 128 {
+            let mid = lo + (hi - lo) / 2;
+            if gross_pos_bps(q, mid)? <= max_total {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+            i += 1;
+        }
+        lo
+    };
     if fill == 0 {
         return Some((0, q.oracle_e6, 0));
     }
-    // Budget for impact, assuming the skew term at the full requested fill (an upper bound
-    // for the part that matters: surcharge is non-decreasing in size).
-    let skew_full = skew_net_bps(
-        q.inv_pre,
-        fill,
-        lp_sells,
-        q.s_mult_bps,
-        q.r_mult_bps,
-        q.skew_cap_bps,
-        q.rebate_cap_bps,
-        q.ref_inv,
-    )?;
-    let fixed = base + q.fee_bps + (skew_full.max(0) as u128);
-    if fixed >= max_total && q.impact_k_bps > 0 {
-        return Some((0, q.oracle_e6, 0));
-    }
-    let budget = max_total.saturating_sub(fixed);
-    let oracle = q.oracle_e6 as u128;
-    if q.impact_k_bps > 0 {
-        let n_max = cp_max_notional_for_budget(q.depth_e6, q.impact_k_bps, budget);
-        // fill * oracle / 1e6 <= n_max  <=  fill <= n_max * 1e6 / oracle
-        let fill_max = match n_max.checked_mul(1_000_000) {
-            Some(v) => v / oracle,
-            None => (n_max / oracle).saturating_mul(1_000_000),
-        };
-        fill = fill.min(fill_max);
-        if fill == 0 {
-            return Some((0, q.oracle_e6, 0));
-        }
-    }
-    let notional = fill.checked_mul(oracle)? / 1_000_000;
-    let impact = cp_impact_bps(notional, q.depth_e6, q.impact_k_bps)?;
-    let skew = skew_net_bps(
-        q.inv_pre,
-        fill,
-        lp_sells,
-        q.s_mult_bps,
-        q.r_mult_bps,
-        q.skew_cap_bps,
-        q.rebate_cap_bps,
-        q.ref_inv,
-    )?;
-    let gross = (base + q.fee_bps + impact) as i128 + skew;
+    let (impact, skew) = impact_and_skew(q, fill)?;
+    let gross = (q.base_spread_bps as u128 + q.fee_bps + impact) as i128 + skew;
     // Never below 0 (price never crosses the oracle in the taker's favour), never above
     // max_total.
     let total = (gross.max(0) as u128).min(max_total);
     let price = price_with_total_bps(q.oracle_e6, total, q.taker_buys)?;
     Some((fill, price, total))
+}
+
+/// (impact bps, signed skew bps) at `fill`; impact is u128::MAX (infeasible) when the
+/// notional reaches the virtual depth.
+fn impact_and_skew(q: &AdaptiveQuoteIn, fill: u128) -> Option<(u128, i128)> {
+    let notional = fill.checked_mul(q.oracle_e6 as u128)? / 1_000_000;
+    let impact = if q.impact_k_bps > 0 && notional >= q.depth_e6 {
+        u128::MAX
+    } else {
+        cp_impact_bps(notional, q.depth_e6, q.impact_k_bps)?
+    };
+    let skew = skew_net_bps(
+        q.inv_pre,
+        fill,
+        q.taker_buys,
+        q.s_mult_bps,
+        q.r_mult_bps,
+        q.skew_cap_bps,
+        q.rebate_cap_bps,
+        q.ref_inv,
+    )?;
+    Some((impact, skew))
+}
+
+/// base + fee + impact + max(skew, 0), saturating (u128::MAX == infeasible).
+fn gross_pos_bps(q: &AdaptiveQuoteIn, fill: u128) -> Option<u128> {
+    if fill == 0 {
+        return Some(0);
+    }
+    let (impact, skew) = impact_and_skew(q, fill)?;
+    Some(
+        (q.base_spread_bps as u128)
+            .saturating_add(q.fee_bps)
+            .saturating_add(impact)
+            .saturating_add(skew.max(0) as u128),
+    )
 }
 
 // =============================================================================
@@ -819,7 +840,9 @@ pub fn mark_state(
     if c.observed_stale_slots > 0 {
         if obs.0 != oracle_e6 || obs.1 > now_slot {
             *obs = (oracle_e6, now_slot);
-        } else if now_slot - obs.1 > c.observed_stale_slots as u64 {
+        } else if ext_mark_slot.is_none() && now_slot - obs.1 > c.observed_stale_slots as u64 {
+            // Only without an authoritative mark_slot: a fresh wrapper mark_slot proves the
+            // keeper alive (backtest: the fallback otherwise refused benign fills).
             stale = true;
         }
     }
@@ -1078,6 +1101,7 @@ mod proofs {
     /// max_total, never grows the fill, and never overflows (returns Some).
     #[kani::proof]
     #[kani::solver(cadical)]
+    #[kani::unwind(24)]
     fn proof_quote_never_crosses_oracle() {
         let q = any_quote();
         if let Some((fill, price, total)) = quote_adaptive(&q) {
@@ -1095,6 +1119,22 @@ mod proofs {
             kani::cover!(fill > 0 && q.taker_buys && price > q.oracle_e6);
             kani::cover!(fill > 0 && !q.taker_buys && price < q.oracle_e6);
             kani::cover!(fill > 0 && fill < q.fill); // size clip exercised
+        }
+    }
+
+    /// Realised fill is monotone non-decreasing in the REQUESTED size (fixed state).
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    #[kani::unwind(24)]
+    fn proof_quote_fill_monotone_in_request() {
+        let q = any_quote();
+        let bigger: u128 = kani::any();
+        kani::assume(bigger >= q.fill && bigger < (1u128 << 20));
+        let mut q2 = q;
+        q2.fill = bigger;
+        if let (Some((f1, _, _)), Some((f2, _, _))) = (quote_adaptive(&q), quote_adaptive(&q2)) {
+            assert!(f1 <= f2);
+            kani::cover!(f1 > 0 && f1 < q.fill);
         }
     }
 

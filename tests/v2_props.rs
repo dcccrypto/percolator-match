@@ -192,6 +192,21 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(4000))]
+    /// Realised fill never shrinks when the request grows (backtest finding).
+    #[test]
+    fn quote_fill_monotone_in_request(oracle in 1u64..=1_000_000_000_000, f1 in 1u128..(1u128 << 50),
+                                      f2 in 1u128..(1u128 << 50), buy in any::<bool>(),
+                                      inv in -(1i128 << 50)..(1i128 << 50), fee in 0u128..=300,
+                                      k in 0u32..=100_000, depth in 1u128..(1u128 << 70), sp in skew_params()) {
+        let (a, b) = if f1 <= f2 { (f1, f2) } else { (f2, f1) };
+        let qa = quote_adaptive(&quote_in(oracle, a, buy, inv, fee, k, depth, sp));
+        let qb = quote_adaptive(&quote_in(oracle, b, buy, inv, fee, k, depth, sp));
+        if let (Some(x), Some(y)) = (qa, qb) { prop_assert!(x.0 <= y.0, "{} > {}", x.0, y.0); }
+    }
+}
+
 thread_local! {
     static DENSE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static DENSE_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };

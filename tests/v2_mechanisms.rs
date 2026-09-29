@@ -1140,3 +1140,69 @@ fn exec_band_bounds_quote_and_control() {
     assert!(bps(wide.exec_price_e6) > 50);
     assert!(bps(narrow.exec_price_e6) <= 50);
 }
+
+// -----------------------------------------------------------------------------
+// Backtest findings (P2 backtest agent)
+// -----------------------------------------------------------------------------
+
+/// Exact reproducer from `backtest -- probe`: a larger request used to fill LESS.
+#[test]
+fn kind2_fill_monotone_in_request_backtest_repro() {
+    let cfg = default_config_for_kind2(10, 20, 400, 100, 28_571_428_571_428);
+    let mut c = core_ctx(2);
+    c.base_spread_bps = 20;
+    c.max_total_bps = 400;
+    c.impact_k_bps = 10_000;
+    c.liquidity_notional_e6 = 100_000_000_000;
+    c.skew_spread_mult_bps = 100;
+    c.max_inventory_abs = 28_571_428_571_428;
+    c.max_fill_abs = 7_142_857_142_857;
+    c.inventory_base = -14_285_714_285_714;
+    c.set_v2_block(&V2Block::fresh(cfg));
+    c.validate().unwrap();
+    let e = CallExt::default();
+    let small = execute_leg(
+        &mut c.clone(),
+        &call(1400, 1_750_000_000_000),
+        &e,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    let big = execute_leg(
+        &mut c.clone(),
+        &call(1400, 7_000_000_000_000),
+        &e,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(
+        big.exec_size >= small.exec_size,
+        "fill must be monotone in request: {} < {}",
+        big.exec_size,
+        small.exec_size
+    );
+}
+
+#[test]
+fn observed_fallback_yields_to_fresh_mark_slot() {
+    let mut c = kind1_guarded(100, 100, 0);
+    let e = CallExt::default();
+    assert!(leg(&mut c, &call(PX, 1), &e, 1_000).is_ok());
+    // price unchanged for 500 slots, but the wrapper says the mark was refreshed at 1_490
+    let mut fresh = c;
+    assert!(leg(&mut fresh, &call(PX, 1), &ext_mark(1_490), 1_500).is_ok());
+    // negative control: no mark_slot -> the fallback fires
+    let mut none = c;
+    assert_eq!(
+        leg(&mut none, &call(PX, 1), &e, 1_500).unwrap_err(),
+        ProgramError::Custom(ERR_STALE_MARK)
+    );
+    // negative control: a stale mark_slot is still refused by the authoritative guard
+    let mut old = c;
+    assert_eq!(
+        leg(&mut old, &call(PX, 1), &ext_mark(1_000), 1_500).unwrap_err(),
+        ProgramError::Custom(ERR_STALE_MARK)
+    );
+}
