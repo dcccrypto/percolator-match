@@ -49,14 +49,19 @@ pub const CALL_EXT_VERSION_V1: u8 = 1;
 pub const EXT_FLAG_HEADROOM: u8 = 1 << 0;
 /// `mark_slot` is present.
 pub const EXT_FLAG_MARK_SLOT: u8 = 1 << 1;
-const EXT_KNOWN_FLAGS: u8 = EXT_FLAG_HEADROOM | EXT_FLAG_MARK_SLOT;
+/// The wrapper understands `crate::FLAG_REQUESTED_FEE_MASK` in the return flags and may
+/// charge it. Without this bit the matcher never sets those bits, so a wrapper whose
+/// `validate_matcher_return` rejects unknown flag bits (v18.2) is never broken.
+pub const EXT_FLAG_ACCEPTS_FEE_REQUEST: u8 = 1 << 2;
+const EXT_KNOWN_FLAGS: u8 = EXT_FLAG_HEADROOM | EXT_FLAG_MARK_SLOT | EXT_FLAG_ACCEPTS_FEE_REQUEST;
 
 /// Parsed call extension.
 ///
 /// Wire (offsets relative to the start of the 24-byte block; absolute call offset = +43):
 /// ```text
 /// 0      u8   ext_version   (0 = legacy: all 24 bytes must be zero; 1 = this layout)
-/// 1      u8   ext_flags     (bit0 HEADROOM, bit1 MARK_SLOT; other bits must be 0)
+/// 1      u8   ext_flags     (bit0 HEADROOM, bit1 MARK_SLOT, bit2 ACCEPTS_FEE_REQUEST;
+///                           other bits must be 0)
 /// 2..4   u16  reserved      (must be 0)
 /// 4..12  u64  mark_slot     slot of the last fresh oracle observation behind
 ///                           oracle_price_e6 (must be 0 unless MARK_SLOT set)
@@ -69,6 +74,7 @@ const EXT_KNOWN_FLAGS: u8 = EXT_FLAG_HEADROOM | EXT_FLAG_MARK_SLOT;
 pub struct CallExt {
     pub headroom_q: Option<u64>,
     pub mark_slot: Option<u64>,
+    pub accepts_fee_request: bool,
 }
 
 impl CallExt {
@@ -102,6 +108,7 @@ impl CallExt {
                 Ok(Self {
                     headroom_q: (flags & EXT_FLAG_HEADROOM != 0).then_some(headroom),
                     mark_slot: (flags & EXT_FLAG_MARK_SLOT != 0).then_some(mark_slot),
+                    accepts_fee_request: flags & EXT_FLAG_ACCEPTS_FEE_REQUEST != 0,
                 })
             }
             _ => Err(ProgramError::InvalidInstructionData),
@@ -109,7 +116,7 @@ impl CallExt {
     }
 
     pub fn is_legacy(&self) -> bool {
-        self.headroom_q.is_none() && self.mark_slot.is_none()
+        self.headroom_q.is_none() && self.mark_slot.is_none() && !self.accepts_fee_request
     }
 
     pub fn encode(&self) -> [u8; CALL_EXT_LEN] {
@@ -127,9 +134,29 @@ impl CallExt {
             flags |= EXT_FLAG_HEADROOM;
             b[12..20].copy_from_slice(&h.to_le_bytes());
         }
+        if self.accepts_fee_request {
+            flags |= EXT_FLAG_ACCEPTS_FEE_REQUEST;
+        }
         b[1] = flags;
         b
     }
+}
+
+/// The matcher's quote expressed as a taker fee on mark-settled notional:
+/// ceil(|exec - oracle| * 1e4 / oracle), capped at `crate::REQUESTED_FEE_BPS_MAX`.
+///
+/// Why: on v18.2 the wrapper settles every fill at the asset mark and uses the matcher's
+/// exec_price only for the taker limit check / hybrid mark input (percolator-prog
+/// `src/v16_program.rs` F-TRADENOCPI-FEE). A spread in exec_price therefore pays the LP
+/// nothing. A wrapper that sets `EXT_FLAG_ACCEPTS_FEE_REQUEST` can charge this instead.
+pub fn requested_fee_bps(oracle_e6: u64, exec_price_e6: u64) -> u32 {
+    if oracle_e6 == 0 {
+        return 0;
+    }
+    let o = oracle_e6 as u128;
+    let d = (exec_price_e6 as u128).abs_diff(o);
+    let bps = div_ceil(d * BPS, o);
+    bps.min(crate::REQUESTED_FEE_BPS_MAX as u128) as u32
 }
 
 // =============================================================================

@@ -107,6 +107,13 @@ pub const FLAG_BACKING_FEE_CAP_SHIFT: u32 = 8;
 pub const FLAG_BACKING_FEE_CAP_MASK: u32 = 0x3fff << FLAG_BACKING_FEE_CAP_SHIFT;
 /// Upper bound the wrapper enforces on the decoded cap (100.00%).
 pub const BACKING_FEE_CAP_BPS_MAX: u16 = 10_000;
+/// P2: bits 22..31 of `flags` carry the matcher's quote as a requested taker fee (bps,
+/// 0..=1023) — ONLY when the call extension set `v2::EXT_FLAG_ACCEPTS_FEE_REQUEST`. The
+/// deployed v18.2 wrapper rejects unknown flag bits and never sets that extension flag,
+/// so it never sees these bits. See `v2::requested_fee_bps`.
+pub const FLAG_REQUESTED_FEE_SHIFT: u32 = 22;
+pub const FLAG_REQUESTED_FEE_MASK: u32 = 0x3ff << FLAG_REQUESTED_FEE_SHIFT;
+pub const REQUESTED_FEE_BPS_MAX: u32 = 0x3ff;
 
 // =============================================================================
 // Oracle Price Validation Constants
@@ -166,6 +173,19 @@ impl MatcherReturn {
     pub fn with_backing_fee_cap_bps(mut self, cap_bps: u16) -> Self {
         self.flags = (self.flags & !FLAG_BACKING_FEE_CAP_MASK)
             | (((cap_bps as u32) << FLAG_BACKING_FEE_CAP_SHIFT) & FLAG_BACKING_FEE_CAP_MASK);
+        self
+    }
+
+    /// Decode the requested taker fee (bps) from `flags` bits 22..31.
+    pub fn requested_fee_bps(&self) -> u32 {
+        (self.flags & FLAG_REQUESTED_FEE_MASK) >> FLAG_REQUESTED_FEE_SHIFT
+    }
+
+    /// Set bits 22..31 of `flags` to `fee_bps` (masked; other bits untouched).
+    pub fn with_requested_fee_bps(mut self, fee_bps: u32) -> Self {
+        self.flags = (self.flags & !FLAG_REQUESTED_FEE_MASK)
+            | ((fee_bps.min(REQUESTED_FEE_BPS_MAX) << FLAG_REQUESTED_FEE_SHIFT)
+                & FLAG_REQUESTED_FEE_MASK);
         self
     }
 

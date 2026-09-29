@@ -757,10 +757,20 @@ pub fn process_call_with_clock(
     // builder masks to FLAG_BACKING_FEE_CAP_MASK regardless, so this can never touch
     // flags::FLAG_VALID / FLAG_PARTIAL_OK / FLAG_REJECTED.
     .with_backing_fee_cap_bps(ctx.backing_fee_cap_bps);
+    let ret = with_fee_request(ret, &ext, call.oracle_price_e6);
 
     let mut data = ctx_account.try_borrow_mut_data()?;
     ret.write_to(&mut data)?;
     Ok(())
+}
+
+/// P2: attach the requested taker fee iff the wrapper negotiated it and the leg filled.
+pub fn with_fee_request(ret: MatcherReturn, ext: &CallExt, oracle_price_e6: u64) -> MatcherReturn {
+    if ext.accepts_fee_request && ret.exec_size != 0 {
+        ret.with_requested_fee_bps(v2::requested_fee_bps(oracle_price_e6, ret.exec_price_e6))
+    } else {
+        ret
+    }
 }
 
 /// Result of pricing one leg.
@@ -1155,6 +1165,7 @@ pub fn process_batch_call_with_clock(
         // sync/v16-migration-backing-fee-cap: same cap on every leg of the batch —
         // it's a per-context (per-LP) config, not per-leg.
         .with_backing_fee_cap_bps(ctx.backing_fee_cap_bps);
+        let ret = with_fee_request(ret, &ext, oracle_price_e6);
         ret.write_to(&mut returns[i * MATCHER_RETURN_LEN..])?;
     }
 
