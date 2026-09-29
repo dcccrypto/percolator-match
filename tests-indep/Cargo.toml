@@ -1,0 +1,16 @@
+# INDEPENDENT SUITE (2026-09-30): P2 matcher v2 tests written from the design docs
+# (ledger/p2-matcher-v2-2026-09-29.md FE.1-FE.3, docs/MATCHER_V2_ABI.md), NOT from src/v2.rs.
+# Pure wire encoders; no dependency on the matcher crate. Matcher .so via INDEP_MATCHER_SO.
+[package]
+name = "percolator-match-indep-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dev-dependencies]
+litesvm = "=0.6.1"
+solana-sdk = "=2.2.1"
+rand = "0.8"
+rand_xorshift = "0.3"
