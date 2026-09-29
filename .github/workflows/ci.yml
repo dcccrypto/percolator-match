@@ -121,6 +121,20 @@ jobs:
           ls -l "$so"
           echo "sha256: $(sha256sum "$so" | cut -d' ' -f1)"
 
+      # P2 matcher v2: run the LiteSVM suite against the .so built above. It includes a
+      # v1-parity test (kinds 0/1, legacy calls must leave all 320 ctx bytes identical to the
+      # deployed 12bd671 program), so build that baseline from history first. The suite
+      # FAILS (not skips) if either .so is missing.
+      - name: build v1 baseline (12bd671) for parity
+        run: |
+          mkdir -p /tmp/v1-12bd671
+          git archive 12bd671 | tar -x -C /tmp/v1-12bd671
+          (cd /tmp/v1-12bd671 && cargo build-sbf)
+          echo "V1_SO=/tmp/v1-12bd671/target/deploy/percolator_match.so" >> "$GITHUB_ENV"
+
+      - name: LiteSVM suite (tests-litesvm/)
+        run: cargo test --manifest-path tests-litesvm/Cargo.toml -- --test-threads=1
+
   parity:
     name: sdk parity fixture
     runs-on: ubuntu-latest
@@ -165,16 +179,3 @@ jobs:
           fi
           echo "matcher parity OK"
 
-      # P2 matcher v2: run the LiteSVM suite against the .so built above. It includes a
-      # v1-parity test (kinds 0/1, legacy calls must leave all 320 ctx bytes identical to the
-      # deployed 12bd671 program), so build that baseline from history first. The suite
-      # FAILS (not skips) if either .so is missing.
-      - name: build v1 baseline (12bd671) for parity
-        run: |
-          mkdir -p /tmp/v1-12bd671
-          git archive 12bd671 | tar -x -C /tmp/v1-12bd671
-          (cd /tmp/v1-12bd671 && cargo build-sbf)
-          echo "V1_SO=/tmp/v1-12bd671/target/deploy/percolator_match.so" >> "$GITHUB_ENV"
-
-      - name: LiteSVM suite (tests-litesvm/)
-        run: cargo test --manifest-path tests-litesvm/Cargo.toml -- --test-threads=1
