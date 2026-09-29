@@ -21,8 +21,8 @@ Tag-3 batch: `18 + 26·n` bytes is legacy. `18 + 26·n + 24·n` is legs followed
 | off (in block) | abs (tag 0) | type | field | rule |
 |---|---|---|---|---|
 | 0 | 43 | u8 | `ext_version` | 0 = legacy (all 24 bytes must be 0); 1 = this layout; anything else is rejected |
-| 1 | 44 | u8 | `ext_flags` | bit0 `HEADROOM`, bit1 `MARK_SLOT`, bit2 `ACCEPTS_FEE_REQUEST`; other bits must be 0 |
-| 2..4 | 45..47 | u16 | reserved | must be 0 |
+| 1 | 44 | u8 | `ext_flags` | bit0 `HEADROOM`, bit1 `MARK_SLOT`, bit2 `ACCEPTS_FEE_REQUEST`, bit3 `TAKER_REDUCING`, bit4 `EXEC_BAND`; bits 5..7 must be 0 |
+| 2..4 | 45..47 | u16 | `exec_band_bps` | the wrapper's oracle band on exec_price; must be 0 unless `EXEC_BAND` is set |
 | 4..12 | 47..55 | u64 | `mark_slot` | slot of the last *fresh oracle observation* behind `oracle_price_e6` (for AUTH_MARK: the push slot, e.g. `last_good_oracle_slot`); must be 0 unless `MARK_SLOT` is set |
 | 12..20 | 55..63 | u64 | `lp_headroom_q` | max \|exec_size\| (base q) the wrapper will accept **in this request's direction** without the LP failing its cap/margin; `u64::MAX` = unbounded; 0 = zero-fill; must be 0 unless `HEADROOM` is set |
 | 20..24 | 63..67 | u32 | reserved | must be 0 |
@@ -30,6 +30,8 @@ Tag-3 batch: `18 + 26·n` bytes is legacy. `18 + 26·n + 24·n` is legs followed
 Matcher behaviour:
 - **HEADROOM.** The fill is clipped to `headroom − already_filled_this_batch(asset, direction)`. At 0 the call returns a zero-fill (`exec_size = 0`, `exec_price = oracle`, `FLAG_PARTIAL_OK`), so the wrapper does not revert with Custom(49). This applies to every matcher kind.
 - **MARK_SLOT.** If the ctx has a v2 block with `max_mark_age_slots > 0` and `Clock.slot − mark_slot > max_mark_age_slots`, the CPI fails with `Custom(8002)` ERR_STALE_MARK. `mark_slot > Clock.slot` fails with `Custom(8003)`. Optionally (ctx flag `STALE_ALLOW_REDUCING`) the matcher still fills trades that reduce the LP's inventory, clipped so they cannot flip it.
+- **TAKER_REDUCING** (added after security review P2-1). The wrapper attests the request only reduces the *taker's* existing position and cannot open or flip it. Under a stale mark, and when the ctx allows reducing fills (the kind-2 default), the fill goes through unclipped, so traders can always exit. Without it, only fills that reduce the *LP's* inventory are let through under a stale mark (clipped to |LP inventory|). The matcher cannot see the taker's position.
+- **EXEC_BAND** (added after P2-2). The matcher prices within `min(max_total_bps, exec_band_bps)`: kind 2 clips size, and kinds 0/1 clamp their spread. A banded P1 wrapper therefore gets a partial fill instead of reverting with Custom(66).
 - **ACCEPTS_FEE_REQUEST.** On a non-zero fill, return `flags` bits 22..31 carry `requested_fee_bps = ceil(|exec−oracle|·1e4/oracle)`, capped at 1023. That is the matcher's quote expressed as a fee on mark-settled notional. Without this flag those bits are always 0.
 
 ## 3. Why the fee-request channel exists (security review C-1, verified)
@@ -186,3 +188,18 @@ Preserved across op 1:
 - the asset binding and the observed-mark tracker.
 
 The volatility estimator restarts, with the cold fee until warm.
+
+## P1 status (read from `feat/p1-safety-release@3ea438b0`, read-only, 2026-09-29 ~20:40)
+
+P1 already implements this ABI (`risk_limits_v17::encode_matcher_call_ext`):
+- It sends `ext_version 1` with `HEADROOM|MARK_SLOT`, `mark_slot = last_good_oracle_slot` and `headroom` saturated to u64.
+- It is gated by a per-asset protocol flag, `AssetRiskLimitsV17::matcher_ext_mode` (0 = legacy bytes).
+- It clips the request to headroom itself before the CPI. The matcher's headroom clip is then a no-op second line.
+
+`last_good_oracle_slot` is written from `Clock::get().slot` (`authenticated_slot_or_fallback`). That is the same clock the matcher reads, so the comparison is consistent. Keeper hold-republishes also advance it, so the authoritative path does not have the P2-1 false positive.
+
+Requests to P1:
+1. Also set `EXEC_BAND` with its effective `exec_band_bps`, so kind-2 quotes clip instead of hitting Custom(66).
+2. Set `TAKER_REDUCING` when the leg only reduces the taker's position. Without it, a taker whose close *grows* the LP's inventory is refused under a stale mark.
+3. Leave `ACCEPTS_FEE_REQUEST` off until the wrapper accepts return bits 22..31 and routes the fee.
+4. Keep `matcher_ext_mode = 0` until the matcher program on that asset is upgraded to v2. The deployed `12bd671` rejects non-zero bytes 43..67.
