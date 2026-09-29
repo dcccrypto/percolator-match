@@ -3,6 +3,7 @@
 extern crate alloc;
 
 pub mod passive_lp_matcher;
+pub mod v2;
 pub mod vamm;
 
 pub use passive_lp_matcher::*;
@@ -269,11 +270,10 @@ impl MatcherCall {
         let oracle_price_e6 = u64::from_le_bytes(data[19..27].try_into().unwrap());
         let req_size = i128::from_le_bytes(data[27..43].try_into().unwrap());
 
-        for &b in &data[43..67] {
-            if b != 0 {
-                return Err(ProgramError::InvalidInstructionData);
-            }
-        }
+        // P2: bytes 43..67 were "must be zero". All-zero is still the legacy call; an
+        // `ext_version == 1` block carries the wrapper's mark_slot / LP headroom
+        // (`v2::CallExt`). Anything else is rejected, exactly as before.
+        v2::CallExt::parse(&data[v2::CALL_EXT_OFFSET..v2::CALL_EXT_OFFSET + v2::CALL_EXT_LEN])?;
 
         Ok(Self {
             req_id,
@@ -282,6 +282,14 @@ impl MatcherCall {
             oracle_price_e6,
             req_size,
         })
+    }
+
+    /// Parse the 24-byte call extension (bytes 43..67). All-zero == legacy.
+    pub fn parse_ext(data: &[u8]) -> Result<v2::CallExt, ProgramError> {
+        if data.len() < MATCHER_CALL_LEN {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        v2::CallExt::parse(&data[v2::CALL_EXT_OFFSET..v2::CALL_EXT_OFFSET + v2::CALL_EXT_LEN])
     }
 }
 
@@ -306,6 +314,9 @@ pub fn process_instruction(
         MATCHER_INIT_VAMM_TAG => vamm::process_init(program_id, accounts, instruction_data),
         MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG => {
             vamm::process_configure_backing_fee_cap(program_id, accounts, instruction_data)
+        }
+        vamm::MATCHER_CONFIGURE_TAG => {
+            vamm::process_configure(program_id, accounts, instruction_data)
         }
         _ => Err(ProgramError::InvalidInstructionData),
     }

@@ -549,6 +549,9 @@ fn matcher_kind_roundtrip() {
     use percolator_match::vamm::MatcherKind;
     assert_eq!(MatcherKind::try_from(0u8).unwrap(), MatcherKind::Passive);
     assert_eq!(MatcherKind::try_from(1u8).unwrap(), MatcherKind::Vamm);
-    assert!(MatcherKind::try_from(2u8).is_err());
+    // P2 (matcher v2) assigns kind 2 = Adaptive. Edited, not weakened: the rejection
+    // boundary moves from 2 to 3 and is still asserted, plus 255.
+    assert_eq!(MatcherKind::try_from(2u8).unwrap(), MatcherKind::Adaptive);
+    assert!(MatcherKind::try_from(3u8).is_err());
     assert!(MatcherKind::try_from(255u8).is_err());
 }

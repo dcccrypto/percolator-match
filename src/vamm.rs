@@ -12,6 +12,7 @@ use solana_program::{
     pubkey::Pubkey,
 };
 
+use crate::v2::{self, CallExt, MarkState, V2Block, V2Config};
 use crate::{
     MatcherCall, MatcherReturn, BACKING_FEE_CAP_BPS_MAX, CTX_VAMM_LEN, CTX_VAMM_OFFSET,
     ERR_INCONSISTENT_LEG_ORACLE_PRICE, FLAG_PARTIAL_OK, FLAG_VALID, MATCHER_ABI_VERSION,
@@ -28,6 +29,10 @@ use crate::{
 pub enum MatcherKind {
     Passive = 0,
     Vamm = 1,
+    /// P2 matcher v2: adaptive fee + constant-product impact + skew surcharge /
+    /// thin-side rebate + stale-mark refusal. Config/state in the v2 block
+    /// (`crate::v2::V2Block`, ctx offsets 178..256).
+    Adaptive = 2,
 }
 
 impl TryFrom<u8> for MatcherKind {
@@ -36,6 +41,7 @@ impl TryFrom<u8> for MatcherKind {
         match value {
             0 => Ok(MatcherKind::Passive),
             1 => Ok(MatcherKind::Vamm),
+            2 => Ok(MatcherKind::Adaptive),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -317,7 +323,34 @@ impl MatcherCtx {
         if self.backing_fee_cap_bps > BACKING_FEE_CAP_BPS_MAX {
             return Err(ProgramError::InvalidAccountData);
         }
+        // P2: a kind-2 context MUST carry a valid v2 block; a kind-0/1 context MAY carry
+        // one (stale guard / binding only). All-zero reserved bytes == no block == v1.
+        match V2Block::decode(&self._reserved) {
+            Some(b) => v2::validate_config(
+                &b.cfg,
+                self.kind,
+                self.base_spread_bps,
+                self.max_total_bps,
+                self.skew_spread_mult_bps,
+                self.impact_k_bps,
+                self.liquidity_notional_e6,
+            )?,
+            None => {
+                if kind == MatcherKind::Adaptive || self._reserved.iter().any(|&b| b != 0) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The v2 block, if this context carries one.
+    pub fn v2_block(&self) -> Option<V2Block> {
+        V2Block::decode(&self._reserved)
+    }
+
+    pub fn set_v2_block(&mut self, b: &V2Block) {
+        self._reserved = b.encode();
     }
 }
 
@@ -480,7 +513,7 @@ pub fn process_init(
     let max_fill_clamped = core::cmp::min(params.max_fill_abs, i128::MAX as u128);
     let max_inv_clamped = core::cmp::min(params.max_inventory_abs, i128::MAX as u128);
 
-    let ctx = MatcherCtx {
+    let mut ctx = MatcherCtx {
         magic: MATCHER_MAGIC,
         version: MATCHER_VERSION,
         kind: params.kind,
@@ -509,6 +542,20 @@ pub fn process_init(
         backing_fee_cap_bps: 0,
         _reserved: [0; 78],
     };
+    // P2: the fixed 78-byte tag-2 payload (the only thing wrapper tag 83 can send) has no
+    // room for v2 config, so a kind-2 context starts from conservative defaults derived
+    // from its core params. The LP owner retunes them with tag 5. Kinds 0/1 keep an
+    // all-zero reserved area, i.e. they are byte-identical to a v1-created context.
+    if params.kind == MatcherKind::Adaptive as u8 {
+        let cfg = v2::default_config_for_kind2(
+            params.trading_fee_bps,
+            params.base_spread_bps,
+            params.max_total_bps,
+            params.skew_spread_mult_bps,
+            max_inv_clamped,
+        );
+        ctx.set_v2_block(&V2Block::fresh(cfg));
+    }
     ctx.validate()?;
 
     let mut data = ctx_account.try_borrow_mut_data()?;
@@ -621,7 +668,26 @@ pub fn process_call(
     ctx_account: &AccountInfo,
     instruction_data: &[u8],
 ) -> ProgramResult {
+    process_call_with_clock(lp_pda, ctx_account, instruction_data, clock_slot)
+}
+
+/// Current slot from the Clock sysvar (syscall; no account needed).
+pub fn clock_slot() -> Result<u64, ProgramError> {
+    use solana_program::sysvar::Sysvar;
+    Ok(solana_program::clock::Clock::get()?.slot)
+}
+
+/// `process_call` with an injectable slot source, so native unit tests can drive the v2
+/// time-dependent paths. The slot source is only invoked when the context carries a v2
+/// block (legacy contexts never touch the Clock, exactly as in v1).
+pub fn process_call_with_clock(
+    lp_pda: &AccountInfo,
+    ctx_account: &AccountInfo,
+    instruction_data: &[u8],
+    slot_source: fn() -> Result<u64, ProgramError>,
+) -> ProgramResult {
     let call = MatcherCall::parse(instruction_data)?;
+    let ext = MatcherCall::parse_ext(instruction_data)?;
 
     if call.oracle_price_e6 == 0 {
         return Err(ProgramError::InvalidInstructionData);
@@ -662,29 +728,13 @@ pub fn process_call(
         return Err(ProgramError::InvalidInstructionData);
     }
 
-    let (exec_price, exec_size, flags) = compute_execution(&ctx, &call)?;
-
-    if exec_size != 0 {
-        // 3E.3: Use checked_sub to surface underflow rather than silently saturating.
-        ctx.inventory_base = ctx
-            .inventory_base
-            .checked_sub(exec_size)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-        ctx.last_oracle_price_e6 = call.oracle_price_e6;
-        ctx.last_exec_price_e6 = exec_price;
-
-        // Accrue insurance fee
-        if ctx.fee_to_insurance_bps > 0 {
-            let (insurance_fee, remainder) = compute_insurance_fee(&ctx, exec_size, exec_price);
-            // PERC-321: Use checked_add to detect overflow instead of silently
-            // saturating (which would lose insurance fees at u64::MAX).
-            ctx.insurance_accrued_e6 = ctx
-                .insurance_accrued_e6
-                .checked_add(insurance_fee)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
-            ctx.insurance_fee_remainder_e6 = remainder;
-        }
-    }
+    let now = if ctx.v2_block().is_some() {
+        Some(slot_source()?)
+    } else {
+        None
+    };
+    let out = execute_leg(&mut ctx, &call, &ext, now, 0)?;
+    apply_fill(&mut ctx, &out, call.oracle_price_e6)?;
 
     {
         let mut data = ctx_account.try_borrow_mut_data()?;
@@ -693,9 +743,9 @@ pub fn process_call(
 
     let ret = MatcherReturn {
         abi_version: crate::MATCHER_ABI_VERSION,
-        flags,
-        exec_price_e6: exec_price,
-        exec_size,
+        flags: out.flags,
+        exec_price_e6: out.exec_price_e6,
+        exec_size: out.exec_size,
         req_id: call.req_id,
         lp_account_id: call.lp_account_id,
         oracle_price_e6: call.oracle_price_e6,
@@ -713,6 +763,207 @@ pub fn process_call(
     Ok(())
 }
 
+/// Result of pricing one leg.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LegOut {
+    pub exec_price_e6: u64,
+    pub exec_size: i128,
+    pub flags: u32,
+    /// Trading fee (bps) that priced this leg: `trading_fee_bps` for kinds 0/1, the
+    /// adaptive fee for kind 2. Used for the insurance slice.
+    pub fee_bps: u32,
+}
+
+/// Commit a priced leg into the context: inventory, last prices, insurance accrual.
+/// Identical to the v1 in-line update in process_call / process_batch_call, except that
+/// the insurance slice uses the fee that actually priced the leg.
+pub fn apply_fill(
+    ctx: &mut MatcherCtx,
+    out: &LegOut,
+    oracle_price_e6: u64,
+) -> Result<(), ProgramError> {
+    if out.exec_size == 0 {
+        return Ok(());
+    }
+    // 3E.3: Use checked_sub to surface underflow rather than silently saturating.
+    ctx.inventory_base = ctx
+        .inventory_base
+        .checked_sub(out.exec_size)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    ctx.last_oracle_price_e6 = oracle_price_e6;
+    ctx.last_exec_price_e6 = out.exec_price_e6;
+    if ctx.fee_to_insurance_bps > 0 {
+        let mut fee_ctx = *ctx;
+        fee_ctx.trading_fee_bps = out.fee_bps;
+        let (insurance_fee, remainder) =
+            compute_insurance_fee(&fee_ctx, out.exec_size, out.exec_price_e6);
+        // PERC-321: Use checked_add to detect overflow instead of silently
+        // saturating (which would lose insurance fees at u64::MAX).
+        ctx.insurance_accrued_e6 = ctx
+            .insurance_accrued_e6
+            .checked_add(insurance_fee)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        ctx.insurance_fee_remainder_e6 = remainder;
+    }
+    Ok(())
+}
+
+/// Price one leg (single call or one batch leg) and advance v2 state (estimator, observed
+/// mark tracker, asset binding). Does NOT touch inventory — see [`apply_fill`].
+///
+/// * Legacy context (no v2 block), legacy call extension, kind 0/1: exactly v1's
+///   `compute_execution` — no clock, no state change.
+/// * `ext.headroom_q`: fill is clipped to `headroom - headroom_used` (zero-fill at 0).
+/// * v2 block: asset binding (kind 2 / observed staleness), stale-mark refusal
+///   (`ERR_STALE_MARK`), then kind-specific pricing.
+///
+/// `now_slot` must be `Some` whenever the context carries a v2 block.
+pub fn execute_leg(
+    ctx: &mut MatcherCtx,
+    call: &MatcherCall,
+    ext: &CallExt,
+    now_slot: Option<u64>,
+    headroom_used: u128,
+) -> Result<LegOut, ProgramError> {
+    let kind = ctx.get_kind()?;
+    let mut block = ctx.v2_block();
+    if block.is_none() && ext.is_legacy() && kind != MatcherKind::Adaptive {
+        let (p, sz, fl) = compute_execution(ctx, call)?;
+        return Ok(LegOut {
+            exec_price_e6: p,
+            exec_size: sz,
+            flags: fl,
+            fee_bps: ctx.trading_fee_bps,
+        });
+    }
+
+    // Effective limits for this leg (headroom and stale-reducing clips go here, so the
+    // unmodified v1 pricing functions see them as an ordinary max_fill_abs).
+    let mut eff = *ctx;
+    if let Some(h) = ext.headroom_q {
+        let rem = (h as u128).saturating_sub(headroom_used);
+        if eff.max_fill_abs > rem {
+            eff.max_fill_abs = rem;
+        }
+    }
+
+    let is_buy = call.req_size > 0;
+    if let Some(b) = block.as_mut() {
+        let now = now_slot.ok_or(ProgramError::UnsupportedSysvar)?;
+        let needs_bind = kind == MatcherKind::Adaptive || b.cfg.observed_stale_slots > 0;
+        if needs_bind {
+            let want = (call.asset_index as u32 + 1) as u16;
+            if b.st.bound_asset_plus1 == 0 {
+                b.st.bound_asset_plus1 = want;
+            } else if b.st.bound_asset_plus1 != want {
+                return Err(ProgramError::Custom(v2::ERR_ASSET_MISMATCH));
+            }
+        }
+        let mut obs = (b.st.obs_price_e6, b.st.obs_since_slot);
+        match v2::mark_state(&b.cfg, &mut obs, ext.mark_slot, call.oracle_price_e6, now) {
+            MarkState::Fresh => {}
+            MarkState::FutureSlot => {
+                return Err(ProgramError::Custom(v2::ERR_MARK_SLOT_IN_FUTURE));
+            }
+            MarkState::Stale => {
+                // Buy from user => LP sells => inventory decreases.
+                let inv = ctx.inventory_base;
+                let reduces = (is_buy && inv > 0) || (!is_buy && inv < 0);
+                if b.cfg.flags & v2::V2_FLAG_STALE_ALLOW_REDUCING != 0 && reduces {
+                    let cap = inv.unsigned_abs();
+                    if eff.max_fill_abs > cap {
+                        eff.max_fill_abs = cap;
+                    }
+                } else {
+                    return Err(ProgramError::Custom(v2::ERR_STALE_MARK));
+                }
+            }
+        }
+        b.st.obs_price_e6 = obs.0;
+        b.st.obs_since_slot = obs.1;
+    }
+
+    let out = match kind {
+        MatcherKind::Passive | MatcherKind::Vamm => {
+            let (p, sz, fl) = compute_execution(&eff, call)?;
+            LegOut {
+                exec_price_e6: p,
+                exec_size: sz,
+                flags: fl,
+                fee_bps: ctx.trading_fee_bps,
+            }
+        }
+        MatcherKind::Adaptive => {
+            let b = block.as_mut().ok_or(ProgramError::InvalidAccountData)?;
+            let now = now_slot.ok_or(ProgramError::UnsupportedSysvar)?;
+            v2::vol_update(&b.cfg, &mut b.st, call.oracle_price_e6, now);
+            let fee = v2::adaptive_fee_bps(&b.cfg, &b.st);
+            compute_adaptive_execution(&eff, call, &b.cfg, fee)?
+        }
+    };
+    if let Some(b) = block {
+        ctx.set_v2_block(&b);
+    }
+    Ok(out)
+}
+
+fn compute_adaptive_execution(
+    eff: &MatcherCtx,
+    call: &MatcherCall,
+    cfg: &V2Config,
+    fee_bps: u128,
+) -> Result<LegOut, ProgramError> {
+    let req_abs = call.req_size.unsigned_abs();
+    let is_buy = call.req_size > 0;
+    let zero = LegOut {
+        exec_price_e6: call.oracle_price_e6,
+        exec_size: 0,
+        flags: FLAG_VALID | FLAG_PARTIAL_OK,
+        fee_bps: fee_bps as u32,
+    };
+    let fill_abs = if eff.max_fill_abs == 0 {
+        0u128
+    } else {
+        core::cmp::min(req_abs, eff.max_fill_abs)
+    };
+    let fill_abs = check_inventory_limit(eff, fill_abs, is_buy)?;
+    if fill_abs == 0 {
+        return Ok(zero);
+    }
+    let q = v2::AdaptiveQuoteIn {
+        oracle_e6: call.oracle_price_e6,
+        fill: fill_abs,
+        taker_buys: is_buy,
+        inv_pre: eff.inventory_base,
+        base_spread_bps: eff.base_spread_bps,
+        max_total_bps: eff.max_total_bps,
+        fee_bps,
+        impact_k_bps: eff.impact_k_bps,
+        depth_e6: eff.liquidity_notional_e6,
+        s_mult_bps: eff.skew_spread_mult_bps,
+        r_mult_bps: cfg.thin_rebate_mult_bps,
+        skew_cap_bps: cfg.skew_cap_bps,
+        rebate_cap_bps: cfg.rebate_cap_bps,
+        ref_inv: cfg.skew_ref_inventory,
+    };
+    let (fill, price, _total) = v2::quote_adaptive(&q).ok_or(ProgramError::ArithmeticOverflow)?;
+    if fill == 0 {
+        return Ok(zero);
+    }
+    // fill <= fill_abs <= max_fill_abs <= i128::MAX (validate), so the cast is lossless.
+    let exec_size = if is_buy {
+        fill as i128
+    } else {
+        -(fill as i128)
+    };
+    Ok(LegOut {
+        exec_price_e6: price,
+        exec_size,
+        flags: execution_flags(fill, req_abs),
+        fee_bps: fee_bps as u32,
+    })
+}
+
 /// Process a batched matcher call (tag 3): fill N legs against this LP's single inventory in one
 /// CPI. The LP PDA is validated once; each leg runs the same `compute_execution` as the
 /// single-fill path, inventory carries across legs in order, and the N 64-byte returns are emitted
@@ -725,16 +976,32 @@ pub fn process_batch_call(
     ctx_account: &AccountInfo,
     instruction_data: &[u8],
 ) -> ProgramResult {
+    process_batch_call_with_clock(lp_pda, ctx_account, instruction_data, clock_slot)
+}
+
+/// `process_batch_call` with an injectable slot source (see `process_call_with_clock`).
+pub fn process_batch_call_with_clock(
+    lp_pda: &AccountInfo,
+    ctx_account: &AccountInfo,
+    instruction_data: &[u8],
+    slot_source: fn() -> Result<u64, ProgramError>,
+) -> ProgramResult {
     if instruction_data.len() < MATCHER_BATCH_HEADER_LEN {
         return Err(ProgramError::InvalidInstructionData);
     }
     let n = instruction_data[1] as usize;
-    if n == 0
-        || n > MATCHER_BATCH_MAX_LEGS
-        || instruction_data.len() != MATCHER_BATCH_HEADER_LEN + n * MATCHER_BATCH_LEG_LEN
-    {
+    if n == 0 || n > MATCHER_BATCH_MAX_LEGS {
         return Err(ProgramError::InvalidInstructionData);
     }
+    // P2: legacy length (legs only) or legs + one 24-byte call extension per leg.
+    let legs_end = MATCHER_BATCH_HEADER_LEN + n * MATCHER_BATCH_LEG_LEN;
+    let has_ext = if instruction_data.len() == legs_end {
+        false
+    } else if instruction_data.len() == legs_end + n * v2::CALL_EXT_LEN {
+        true
+    } else {
+        return Err(ProgramError::InvalidInstructionData);
+    };
     let req_id = u64::from_le_bytes(instruction_data[2..10].try_into().unwrap());
     let lp_account_id = u64::from_le_bytes(instruction_data[10..18].try_into().unwrap());
 
@@ -815,6 +1082,16 @@ pub fn process_batch_call(
         }
     }
 
+    let now = if ctx.v2_block().is_some() {
+        Some(slot_source()?)
+    } else {
+        None
+    };
+    // Headroom is pre-batch state: legs on the same (asset, direction) consume it jointly.
+    let mut used: [(u16, bool, u128); MATCHER_BATCH_MAX_LEGS] =
+        [(0, false, 0); MATCHER_BATCH_MAX_LEGS];
+    let mut used_count = 0usize;
+
     let mut returns = [0u8; MATCHER_BATCH_MAX_LEGS * MATCHER_RETURN_LEN];
     for i in 0..n {
         // #13: Reset per-leg insurance remainder. Each leg is an independent fill;
@@ -835,6 +1112,12 @@ pub fn process_batch_call(
         if req_size == i128::MIN {
             return Err(ProgramError::InvalidInstructionData);
         }
+        let ext = if has_ext {
+            let eb = legs_end + i * v2::CALL_EXT_LEN;
+            CallExt::parse(&instruction_data[eb..eb + v2::CALL_EXT_LEN])?
+        } else {
+            CallExt::default()
+        };
         let call = MatcherCall {
             req_id,
             asset_index,
@@ -842,32 +1125,28 @@ pub fn process_batch_call(
             oracle_price_e6,
             req_size,
         };
-        let (exec_price, exec_size, flags) = compute_execution(&ctx, &call)?;
-        if exec_size != 0 {
-            // Use checked_sub (not saturating_sub) so any overflow aborts the batch
-            // atomically before the ctx write below — no partial-fill state escapes.
-            ctx.inventory_base = ctx
-                .inventory_base
-                .checked_sub(exec_size)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
-            ctx.last_oracle_price_e6 = oracle_price_e6;
-            ctx.last_exec_price_e6 = exec_price;
-
-            // Accrue insurance fee per-leg, same as single-fill path.
-            if ctx.fee_to_insurance_bps > 0 {
-                let (insurance_fee, remainder) = compute_insurance_fee(&ctx, exec_size, exec_price);
-                ctx.insurance_accrued_e6 = ctx
-                    .insurance_accrued_e6
-                    .checked_add(insurance_fee)
-                    .ok_or(ProgramError::ArithmeticOverflow)?;
-                ctx.insurance_fee_remainder_e6 = remainder;
+        let dir = req_size > 0;
+        let slot = used[..used_count]
+            .iter()
+            .position(|&(a, d, _)| a == asset_index && d == dir);
+        let already = slot.map(|k| used[k].2).unwrap_or(0);
+        let out = execute_leg(&mut ctx, &call, &ext, now, already)?;
+        // Use checked_sub (not saturating_sub) so any overflow aborts the batch
+        // atomically before the ctx write below — no partial-fill state escapes.
+        apply_fill(&mut ctx, &out, oracle_price_e6)?;
+        let filled = out.exec_size.unsigned_abs();
+        match slot {
+            Some(k) => used[k].2 = used[k].2.saturating_add(filled),
+            None => {
+                used[used_count] = (asset_index, dir, filled);
+                used_count += 1;
             }
         }
         let ret = MatcherReturn {
             abi_version: MATCHER_ABI_VERSION,
-            flags,
-            exec_price_e6: exec_price,
-            exec_size,
+            flags: out.flags,
+            exec_price_e6: out.exec_price_e6,
+            exec_size: out.exec_size,
             req_id,
             lp_account_id,
             oracle_price_e6,
@@ -898,6 +1177,8 @@ fn compute_execution(
     match ctx.get_kind()? {
         MatcherKind::Passive => compute_passive_execution(ctx, call),
         MatcherKind::Vamm => compute_vamm_execution(ctx, call),
+        // Kind 2 is priced only through `execute_leg` (needs the v2 block + clock).
+        MatcherKind::Adaptive => Err(ProgramError::InvalidAccountData),
     }
 }
 
@@ -1186,6 +1467,306 @@ fn check_inventory_limit(
             .unsigned_abs();
         Ok(core::cmp::min(fill_abs, max_fill))
     }
+}
+
+// =============================================================================
+// Configure (Tag 5) — P2. Post-init configuration WITHOUT a wrapper change.
+// =============================================================================
+//
+// Why this exists: every existing config path (tag 2 init, tag 4 backing-fee cap) must be
+// signed by `lp_pda`, which on a real market is the wrapper's matcher-delegate PDA. Only
+// the wrapper can sign for it, and the wrapper only ever signs tag 0 / tag 3 calls and the
+// fixed 78-byte tag-2 init (wrapper tag 83). So tag 4 was unreachable and every context's
+// config was frozen at init (backing_fee_cap_bps stuck at 0 — the P2 side ticket).
+//
+// Tag 5 accepts either:
+//   auth_mode 0: `lp_pda` signs (direct / test contexts, or a future wrapper passthrough);
+//   auth_mode 1: owner proof — the LP OWNER signs and supplies the delegate seeds; the
+//                matcher recomputes
+//                  create_program_address(["matcher", market, lp_portfolio, lp_owner,
+//                                          this_program_id, ctx_key, [bump]], wrapper_id)
+//                and requires it to equal ctx.lp_pda. A PDA is a hash of its seeds, so a
+//                signer that is not the lp_owner the delegate was derived for cannot
+//                reproduce it. TradeCpi derives the delegate from the portfolio's CURRENT
+//                owner, so after an ownership transfer the old ctx no longer fills and the
+//                old owner's authority over it is moot.
+//
+// Wire:
+//   [0] tag = 5
+//   [1] auth_mode (0 | 1)
+//   auth_mode 1 only: [2..34] wrapper_program_id, [34..66] market, [66..98] lp_portfolio,
+//                     [98] bump                                    (header = 99 bytes)
+//   auth_mode 0:                                                   (header = 2 bytes)
+//   [h]   op: 0 = SetBackingFeeCap, 1 = SetParams
+//   op 0: [h+1..h+3] backing_fee_cap_bps u16                        (total h + 3)
+//   op 1: [h+1..h+1+SET_PARAMS_LEN] SetParams (below)               (total h + 1 + 105)
+//
+// Accounts: 0 [signer] authority (lp_pda or lp_owner), 1 [writable] ctx_account.
+
+pub const MATCHER_CONFIGURE_TAG: u8 = 5;
+pub const CONFIGURE_AUTH_LP_PDA: u8 = 0;
+pub const CONFIGURE_AUTH_OWNER_PROOF: u8 = 1;
+pub const CONFIGURE_OP_BACKING_FEE_CAP: u8 = 0;
+pub const CONFIGURE_OP_SET_PARAMS: u8 = 1;
+pub const CONFIGURE_HEADER_LP_PDA_LEN: usize = 2;
+pub const CONFIGURE_HEADER_OWNER_PROOF_LEN: usize = 99;
+/// SetParams payload length (see `SetParams::parse`).
+pub const SET_PARAMS_LEN: usize = 105;
+
+/// Full parameter set for op 1. Core fields replace the context's; v2 config replaces the
+/// v2 block's config and restarts the volatility estimator (cold fee until warm). State
+/// that is not configuration — inventory, insurance accrual, lp_pda, lp_account_id,
+/// backing_fee_cap, asset binding, observed-mark tracker — is preserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetParams {
+    pub kind: u8,
+    pub trading_fee_bps: u32,
+    pub base_spread_bps: u32,
+    pub max_total_bps: u32,
+    pub impact_k_bps: u32,
+    pub liquidity_notional_e6: u128,
+    pub max_fill_abs: u128,
+    pub max_inventory_abs: u128,
+    pub fee_to_insurance_bps: u16,
+    pub skew_spread_mult_bps: u16,
+    /// `enable_v2 == false` clears the v2 block (only legal for kinds 0/1): back to the
+    /// exact v1 behaviour.
+    pub enable_v2: bool,
+    pub v2: V2Config,
+}
+
+impl SetParams {
+    pub fn parse(d: &[u8]) -> Result<Self, ProgramError> {
+        if d.len() != SET_PARAMS_LEN {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let u16_at = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]);
+        let u32_at = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+        let u128_at = |o: usize| u128::from_le_bytes(d[o..o + 16].try_into().unwrap());
+        let enable = match d[69] {
+            0 => false,
+            1 => true,
+            _ => return Err(ProgramError::InvalidInstructionData),
+        };
+        Ok(Self {
+            kind: d[0],
+            trading_fee_bps: u32_at(1),
+            base_spread_bps: u32_at(5),
+            max_total_bps: u32_at(9),
+            impact_k_bps: u32_at(13),
+            liquidity_notional_e6: u128_at(17),
+            max_fill_abs: u128_at(33),
+            max_inventory_abs: u128_at(49),
+            fee_to_insurance_bps: u16_at(65),
+            skew_spread_mult_bps: u16_at(67),
+            enable_v2: enable,
+            v2: V2Config {
+                flags: d[70],
+                fee_lo_bps: u16_at(71),
+                fee_hi_bps: u16_at(73),
+                fee_cold_bps: u16_at(75),
+                vol_a_milli: u16_at(77),
+                vol_b_den: u16_at(79),
+                vol_alpha_bps: u16_at(81),
+                vol_warmup: d[83],
+                vol_move_cap_10bps: d[84],
+                vol_ref_slots: u16_at(85),
+                thin_rebate_mult_bps: u16_at(87),
+                skew_cap_bps: u16_at(89),
+                rebate_cap_bps: u16_at(91),
+                max_mark_age_slots: u16_at(93),
+                observed_stale_slots: u16_at(95),
+                skew_ref_inventory: u64::from_le_bytes(d[97..105].try_into().unwrap()),
+            },
+        })
+    }
+}
+
+impl SetParams {
+    pub fn encode(&self) -> [u8; SET_PARAMS_LEN] {
+        let mut d = [0u8; SET_PARAMS_LEN];
+        let c = &self.v2;
+        d[0] = self.kind;
+        d[1..5].copy_from_slice(&self.trading_fee_bps.to_le_bytes());
+        d[5..9].copy_from_slice(&self.base_spread_bps.to_le_bytes());
+        d[9..13].copy_from_slice(&self.max_total_bps.to_le_bytes());
+        d[13..17].copy_from_slice(&self.impact_k_bps.to_le_bytes());
+        d[17..33].copy_from_slice(&self.liquidity_notional_e6.to_le_bytes());
+        d[33..49].copy_from_slice(&self.max_fill_abs.to_le_bytes());
+        d[49..65].copy_from_slice(&self.max_inventory_abs.to_le_bytes());
+        d[65..67].copy_from_slice(&self.fee_to_insurance_bps.to_le_bytes());
+        d[67..69].copy_from_slice(&self.skew_spread_mult_bps.to_le_bytes());
+        d[69] = self.enable_v2 as u8;
+        d[70] = c.flags;
+        d[71..73].copy_from_slice(&c.fee_lo_bps.to_le_bytes());
+        d[73..75].copy_from_slice(&c.fee_hi_bps.to_le_bytes());
+        d[75..77].copy_from_slice(&c.fee_cold_bps.to_le_bytes());
+        d[77..79].copy_from_slice(&c.vol_a_milli.to_le_bytes());
+        d[79..81].copy_from_slice(&c.vol_b_den.to_le_bytes());
+        d[81..83].copy_from_slice(&c.vol_alpha_bps.to_le_bytes());
+        d[83] = c.vol_warmup;
+        d[84] = c.vol_move_cap_10bps;
+        d[85..87].copy_from_slice(&c.vol_ref_slots.to_le_bytes());
+        d[87..89].copy_from_slice(&c.thin_rebate_mult_bps.to_le_bytes());
+        d[89..91].copy_from_slice(&c.skew_cap_bps.to_le_bytes());
+        d[91..93].copy_from_slice(&c.rebate_cap_bps.to_le_bytes());
+        d[93..95].copy_from_slice(&c.max_mark_age_slots.to_le_bytes());
+        d[95..97].copy_from_slice(&c.observed_stale_slots.to_le_bytes());
+        d[97..105].copy_from_slice(&c.skew_ref_inventory.to_le_bytes());
+        d
+    }
+}
+
+/// Owner-proof seeds for auth mode 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnerProof {
+    pub wrapper_program_id: [u8; 32],
+    pub market: [u8; 32],
+    pub lp_portfolio: [u8; 32],
+    pub bump: u8,
+}
+
+/// Build tag-5 instruction data.
+pub fn encode_configure(proof: Option<&OwnerProof>, op_payload: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::with_capacity(CONFIGURE_HEADER_OWNER_PROOF_LEN + op_payload.len());
+    v.push(MATCHER_CONFIGURE_TAG);
+    match proof {
+        None => v.push(CONFIGURE_AUTH_LP_PDA),
+        Some(p) => {
+            v.push(CONFIGURE_AUTH_OWNER_PROOF);
+            v.extend_from_slice(&p.wrapper_program_id);
+            v.extend_from_slice(&p.market);
+            v.extend_from_slice(&p.lp_portfolio);
+            v.push(p.bump);
+        }
+    }
+    v.extend_from_slice(op_payload);
+    v
+}
+
+/// Process Configure (Tag 5). See the block comment above for wire + auth.
+pub fn process_configure(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+    let authority = next_account_info(account_iter)?;
+    let ctx_account = next_account_info(account_iter)?;
+
+    if ctx_account.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if ctx_account.data_len() < MATCHER_CONTEXT_LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    if !ctx_account.is_writable {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // PM-3: signer check before any account-data inspection.
+    if !authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if instruction_data.len() < CONFIGURE_HEADER_LP_PDA_LEN
+        || instruction_data[0] != MATCHER_CONFIGURE_TAG
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let auth_mode = instruction_data[1];
+    let header_len = match auth_mode {
+        CONFIGURE_AUTH_LP_PDA => CONFIGURE_HEADER_LP_PDA_LEN,
+        CONFIGURE_AUTH_OWNER_PROOF => CONFIGURE_HEADER_OWNER_PROOF_LEN,
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+    if instruction_data.len() < header_len + 1 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut ctx = {
+        let data = ctx_account.try_borrow_data()?;
+        MatcherCtx::read_from(&data[CTX_VAMM_OFFSET..])?
+    };
+    ctx.validate()?;
+
+    match auth_mode {
+        CONFIGURE_AUTH_LP_PDA => {
+            if authority.key.to_bytes() != ctx.lp_pda {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+        _ => {
+            let d = instruction_data;
+            let wrapper = Pubkey::new_from_array(d[2..34].try_into().unwrap());
+            let market: &[u8] = &d[34..66];
+            let portfolio: &[u8] = &d[66..98];
+            let bump = [d[98]];
+            let derived = Pubkey::create_program_address(
+                &[
+                    b"matcher",
+                    market,
+                    portfolio,
+                    authority.key.as_ref(),
+                    program_id.as_ref(),
+                    ctx_account.key.as_ref(),
+                    &bump,
+                ],
+                &wrapper,
+            )
+            .map_err(|_| ProgramError::Custom(v2::ERR_OWNER_PROOF_MISMATCH))?;
+            if derived.to_bytes() != ctx.lp_pda {
+                return Err(ProgramError::Custom(v2::ERR_OWNER_PROOF_MISMATCH));
+            }
+        }
+    }
+
+    let op = instruction_data[header_len];
+    let payload = &instruction_data[header_len + 1..];
+    match op {
+        CONFIGURE_OP_BACKING_FEE_CAP => {
+            if payload.len() != 2 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            let cap = u16::from_le_bytes([payload[0], payload[1]]);
+            if cap > BACKING_FEE_CAP_BPS_MAX {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            ctx.backing_fee_cap_bps = cap;
+        }
+        CONFIGURE_OP_SET_PARAMS => {
+            let p = SetParams::parse(payload)?;
+            let _ = MatcherKind::try_from(p.kind)?;
+            let prev = ctx.v2_block();
+            ctx.kind = p.kind;
+            ctx.trading_fee_bps = p.trading_fee_bps;
+            ctx.base_spread_bps = p.base_spread_bps;
+            ctx.max_total_bps = p.max_total_bps;
+            ctx.impact_k_bps = p.impact_k_bps;
+            ctx.liquidity_notional_e6 = p.liquidity_notional_e6;
+            // Same "unbounded" clamp as process_init (M-NEW-3 / M-HIGH-2).
+            ctx.max_fill_abs = core::cmp::min(p.max_fill_abs, i128::MAX as u128);
+            ctx.max_inventory_abs = core::cmp::min(p.max_inventory_abs, i128::MAX as u128);
+            ctx.fee_to_insurance_bps = p.fee_to_insurance_bps;
+            ctx.skew_spread_mult_bps = p.skew_spread_mult_bps;
+            if p.enable_v2 {
+                let mut b = V2Block::fresh(p.v2);
+                if let Some(old) = prev {
+                    // Preserve non-config state: binding + observed-mark tracker.
+                    b.st.bound_asset_plus1 = old.st.bound_asset_plus1;
+                    b.st.obs_price_e6 = old.st.obs_price_e6;
+                    b.st.obs_since_slot = old.st.obs_since_slot;
+                }
+                ctx.set_v2_block(&b);
+            } else {
+                ctx._reserved = [0; 78];
+            }
+        }
+        _ => return Err(ProgramError::InvalidInstructionData),
+    }
+    ctx.validate()?;
+
+    let mut data = ctx_account.try_borrow_mut_data()?;
+    ctx.write_to(&mut data[CTX_VAMM_OFFSET..])?;
+    Ok(())
 }
 
 // Legacy re-exports
@@ -2768,8 +3349,7 @@ mod tests {
         let params = ConfigureBackingFeeCapParams {
             backing_fee_cap_bps: 250,
         };
-        let result =
-            process_configure_backing_fee_cap(&program_id, &accounts, &params.encode());
+        let result = process_configure_backing_fee_cap(&program_id, &accounts, &params.encode());
         assert_eq!(result, Err(ProgramError::MissingRequiredSignature));
     }
 
@@ -2794,8 +3374,7 @@ mod tests {
         let params = ConfigureBackingFeeCapParams {
             backing_fee_cap_bps: 250,
         };
-        let result =
-            process_configure_backing_fee_cap(&program_id, &accounts, &params.encode());
+        let result = process_configure_backing_fee_cap(&program_id, &accounts, &params.encode());
         assert_eq!(result, Err(ProgramError::InvalidAccountData));
     }
 
@@ -2819,8 +3398,7 @@ mod tests {
         let params = ConfigureBackingFeeCapParams {
             backing_fee_cap_bps: 10_001, // > BACKING_FEE_CAP_BPS_MAX
         };
-        let result =
-            process_configure_backing_fee_cap(&program_id, &accounts, &params.encode());
+        let result = process_configure_backing_fee_cap(&program_id, &accounts, &params.encode());
         assert_eq!(result, Err(ProgramError::InvalidInstructionData));
         // Nothing must have been written on a rejected config.
         let ctx = MatcherCtx::read_from(&ctx_data[CTX_VAMM_OFFSET..]).unwrap();
@@ -2847,8 +3425,7 @@ mod tests {
         let params = ConfigureBackingFeeCapParams {
             backing_fee_cap_bps: 250,
         };
-        let result =
-            process_configure_backing_fee_cap(&program_id, &accounts, &params.encode());
+        let result = process_configure_backing_fee_cap(&program_id, &accounts, &params.encode());
         assert_eq!(result, Err(ProgramError::UninitializedAccount));
     }
 
@@ -2879,8 +3456,7 @@ mod tests {
             let params = ConfigureBackingFeeCapParams {
                 backing_fee_cap_bps: 987,
             };
-            process_configure_backing_fee_cap(&program_id, &accounts, &params.encode())
-                .unwrap();
+            process_configure_backing_fee_cap(&program_id, &accounts, &params.encode()).unwrap();
         }
         {
             let ctx = MatcherCtx::read_from(&ctx_data[CTX_VAMM_OFFSET..]).unwrap();
@@ -2930,7 +3506,11 @@ mod tests {
         let flags = u32::from_le_bytes(ctx_data[4..8].try_into().unwrap());
         let cap = ((flags & FLAG_BACKING_FEE_CAP_MASK_FOR_TEST) >> 8) as u16;
         assert_eq!(cap, 987, "returned flags must carry the configured cap");
-        assert_eq!(flags & FLAG_VALID, FLAG_VALID, "FLAG_VALID must still be set");
+        assert_eq!(
+            flags & FLAG_VALID,
+            FLAG_VALID,
+            "FLAG_VALID must still be set"
+        );
 
         // Decode via the crate's own accessor too — must agree.
         let ret = MatcherReturn {
