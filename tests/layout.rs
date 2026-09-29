@@ -650,8 +650,7 @@ fn backing_fee_cap_round_trip_matches_wrapper_decode() {
             "wrapper decode of cap {cap} must round-trip exactly"
         );
         assert!(
-            wrapper_mirror::validate_matcher_return(&decoded, 42, 3, 99_000_000, 1000, 7)
-                .is_ok(),
+            wrapper_mirror::validate_matcher_return(&decoded, 42, 3, 99_000_000, 1000, 7).is_ok(),
             "wrapper must accept a well-formed return for any in-range cap ({cap})"
         );
     }
@@ -760,7 +759,5 @@ fn wrapper_validate_accepts_well_formed_return_with_max_cap() {
     let mut buf = [0u8; 64];
     ret.write_to(&mut buf).unwrap();
     let decoded = wrapper_mirror::read_matcher_return(&buf).unwrap();
-    assert!(
-        wrapper_mirror::validate_matcher_return(&decoded, 42, 3, 99_000_000, 1000, 7).is_ok()
-    );
+    assert!(wrapper_mirror::validate_matcher_return(&decoded, 42, 3, 99_000_000, 1000, 7).is_ok());
 }

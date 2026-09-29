@@ -103,7 +103,10 @@ fn tag_configure_backing_fee_cap_is_4() {
     // Must not collide with any existing tag.
     assert_ne!(MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG, MATCHER_CALL_TAG);
     assert_ne!(MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG, MATCHER_INIT_VAMM_TAG);
-    assert_ne!(MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG, MATCHER_BATCH_CALL_TAG);
+    assert_ne!(
+        MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG,
+        MATCHER_BATCH_CALL_TAG
+    );
 }
 
 // ---------------------------------------------------------------------------

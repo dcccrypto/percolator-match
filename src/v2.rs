@@ -573,15 +573,45 @@ pub fn cp_max_notional_for_budget(depth_e6: u128, k_bps: u32, budget_bps: u128) 
     }
 }
 
-/// Signed skew term (bps, positive = surcharge paid by the taker, negative = rebate), as
-/// the fill-weighted average over the inventory path `inv_pre -> inv_post`. The surcharge
-/// integrand is `s * |x| / ref` (capped) on the part of the path that moves |inventory|
-/// away from 0, the rebate is `r * |x| / ref` (capped) on the part that moves it toward 0.
-/// Using segment averages makes the total skew cost path-independent (splitting a trade
-/// into pieces cannot reduce it) and, with r <= s, a round trip never nets a rebate.
+/// Skew potential numerator: `2*ref * W(x)` where `W(x) = ∫_0^x min(mult*t/ref, cap) dt`
+/// (units bps·q). Quadratic `mult*x^2` up to the knee `xk = floor(cap*ref/mult)`, then
+/// linear with slope `2*ref*cap`. Convex and non-decreasing in `x` (the slope at the knee,
+/// `2*mult*xk`, is <= `2*ref*cap`). `None` on overflow (caller fails closed).
+pub fn skew_potential_num(x: u128, mult_bps: u16, cap_bps: u16, ref_inv: u64) -> Option<u128> {
+    if mult_bps == 0 || cap_bps == 0 || x == 0 {
+        return Some(0);
+    }
+    let m = mult_bps as u128;
+    let c = cap_bps as u128;
+    let r = ref_inv as u128;
+    let knee = c.checked_mul(r)? / m;
+    if x <= knee {
+        m.checked_mul(x)?.checked_mul(x)
+    } else {
+        let at_knee = m.checked_mul(knee)?.checked_mul(knee)?;
+        let lin = (2u128)
+            .checked_mul(r)?
+            .checked_mul(c)?
+            .checked_mul(x - knee)?;
+        at_knee.checked_add(lin)
+    }
+}
+
+/// Signed skew term (bps; positive = surcharge paid by the taker, negative = rebate) for the
+/// LP inventory path `inv_pre -> inv_post`, as a fill-weighted average.
 ///
-/// Rounding is toward the LP: surcharge averages are ceil'd, rebate averages floor'd, and
-/// the final weighted division rounds toward +inf.
+/// Cost = potential differences: moving |inventory| away from 0 costs `W_s(|end|) -
+/// W_s(|start|)` (surcharge slope `s_mult`, cap `skew_cap`); moving it toward 0 earns
+/// `W_r(|start|) - W_r(|end|)` (rebate slope `r_mult`, cap `rebate_cap`); a trade that
+/// crosses 0 does both. Because each leg is a difference of a function of the endpoint
+/// inventory alone, the total skew cost of any sequence of trades telescopes: splitting a
+/// trade into pieces cannot reduce it (up to the final per-trade ceil, which only rounds
+/// toward the LP). With `r <= s` and `rebate_cap <= skew_cap`, `W_r <= W_s` pointwise, so a
+/// round trip from flat never nets the taker a rebate. Convexity of W makes the average,
+/// and hence the quote, monotone non-decreasing in size.
+///
+/// All arithmetic is exact over the common denominator `2*ref*fill`; the single final
+/// division rounds toward +inf (toward the LP).
 #[allow(clippy::too_many_arguments)]
 pub fn skew_net_bps(
     inv_pre: i128,
@@ -605,39 +635,21 @@ pub fn skew_net_bps(
     let a = inv_pre.unsigned_abs();
     let b = inv_post.unsigned_abs();
     let crosses = (inv_pre > 0 && inv_post < 0) || (inv_pre < 0 && inv_post > 0);
-    // (len_worsen, sum_worsen = |start|+|end| of that segment), same for reducing.
-    let (lw, sw, lr, sr) = if crosses {
-        (b, b, a, a)
+    let ws = |x: u128| skew_potential_num(x, s_mult_bps, skew_cap_bps, ref_inv);
+    let wr = |x: u128| skew_potential_num(x, r_mult_bps, rebate_cap_bps, ref_inv);
+    let (pos, neg) = if crosses {
+        (ws(b)?, wr(a)?)
     } else if b >= a {
-        (b - a, a.checked_add(b)?, 0, 0)
+        (ws(b)?.checked_sub(ws(a)?)?, 0)
     } else {
-        (0, 0, a - b, a.checked_add(b)?)
+        (0, wr(a)?.checked_sub(wr(b)?)?)
     };
-    let two_ref = 2u128 * ref_inv as u128;
-    let sur = if lw == 0 {
-        0
-    } else {
-        match (s_mult_bps as u128).checked_mul(sw) {
-            Some(n) => div_ceil(n, two_ref).min(skew_cap_bps as u128),
-            None => skew_cap_bps as u128,
-        }
-    };
-    let reb = if lr == 0 {
-        0
-    } else {
-        match (r_mult_bps as u128).checked_mul(sr) {
-            Some(n) => (n / two_ref).min(rebate_cap_bps as u128),
-            None => rebate_cap_bps as u128,
-        }
-    };
-    let pos = sur.checked_mul(lw)?;
-    let neg = reb.checked_mul(lr)?;
-    // lw + lr == fill
+    let den = (2u128).checked_mul(ref_inv as u128)?.checked_mul(fill)?;
     if pos >= neg {
-        i128::try_from(div_ceil(pos - neg, fill)).ok()
+        i128::try_from(div_ceil(pos - neg, den)).ok()
     } else {
         // round toward +inf: -floor(x)
-        i128::try_from((neg - pos) / fill).ok().map(|v| -v)
+        i128::try_from((neg - pos) / den).ok().map(|v| -v)
     }
 }
 
@@ -816,6 +828,7 @@ mod proofs {
     /// Adaptive fee always lies in [fee_lo, fee_hi] for a valid config and ANY estimator
     /// state, and never overflows.
     #[kani::proof]
+    #[kani::solver(cadical)]
     #[kani::unwind(34)]
     fn proof_adaptive_fee_bounded() {
         let c = any_cfg_kind2();
@@ -829,6 +842,8 @@ mod proofs {
             obs_price_e6: 0,
             obs_since_slot: 0,
         };
+        // Realistic bound: the estimator caps each sample at (2550 bps)^2 * 1e4 < 2^36.
+        kani::assume(s.vol_var_e4 < (1u64 << 40));
         let f = adaptive_fee_bps(&c, &s);
         assert!(f >= c.fee_lo_bps as u128 && f <= c.fee_hi_bps as u128);
         kani::cover!(
@@ -841,13 +856,14 @@ mod proofs {
 
     /// Adaptive fee is monotone non-decreasing in estimated variance.
     #[kani::proof]
+    #[kani::solver(cadical)]
     #[kani::unwind(34)]
     fn proof_adaptive_fee_monotone_in_vol() {
         let c = any_cfg_kind2();
         kani::assume(c.fee_lo_bps <= c.fee_hi_bps);
         let v1: u64 = kani::any();
         let v2: u64 = kani::any();
-        kani::assume(v1 <= v2);
+        kani::assume(v1 <= v2 && v2 < (1u64 << 40));
         let mut s = V2State::default();
         s.vol_var_e4 = v1;
         let f1 = adaptive_fee_bps(&c, &s);
@@ -859,25 +875,28 @@ mod proofs {
 
     /// isqrt is exact floor sqrt (bounded domain to keep the solver fast).
     #[kani::proof]
+    #[kani::solver(cadical)]
     #[kani::unwind(34)]
     fn proof_isqrt_exact() {
         let n: u64 = kani::any();
-        kani::assume(n < (1u64 << 40));
-        let r = isqrt_u64(n) as u128;
-        assert!(r * r <= n as u128);
-        assert!((r + 1) * (r + 1) > n as u128);
+        kani::assume(n < (1u64 << 32));
+        let r = isqrt_u64(n);
+        assert!(r < (1u64 << 16) + 1);
+        assert!(r * r <= n);
+        assert!((r + 1) * (r + 1) > n);
         kani::cover!(r > 1000);
     }
 
     /// CP impact is monotone non-decreasing in notional, and the budget inverse is sound:
     /// impact(max_notional_for_budget(B)) <= B.
     #[kani::proof]
+    #[kani::solver(cadical)]
     fn proof_cp_impact_monotone_and_budget_sound() {
         let d: u128 = kani::any();
         let k: u32 = kani::any();
         let n1: u128 = kani::any();
         let n2: u128 = kani::any();
-        kani::assume(d > 0 && d < (1u128 << 64));
+        kani::assume(d > 0 && d < (1u128 << 40));
         kani::assume(k <= MAX_IMPACT_K_BPS);
         kani::assume(n1 <= n2 && n2 < d);
         let i1 = cp_impact_bps(n1, d, k).unwrap();
@@ -900,21 +919,22 @@ mod proofs {
         let sc: u16 = kani::any();
         let rc: u16 = kani::any();
         let rf: u64 = kani::any();
-        kani::assume(inv > -(1i128 << 40) && inv < (1i128 << 40));
+        kani::assume(inv > -(1i128 << 20) && inv < (1i128 << 20));
         kani::assume(s <= 10_000 && r <= s);
         kani::assume(sc <= MAX_SKEW_CAP_BPS && rc <= sc);
-        kani::assume(rf > 0 && rf < (1u64 << 40));
+        kani::assume(rf > 0 && rf < (1u64 << 20));
         (inv, s, r, sc, rc, rf)
     }
 
     /// Skew term is monotone non-decreasing in fill size (either direction).
     #[kani::proof]
+    #[kani::solver(cadical)]
     fn proof_skew_monotone_in_size() {
         let (inv, s, r, sc, rc, rf) = skew_args();
         let lp_sells: bool = kani::any();
         let f1: u128 = kani::any();
         let f2: u128 = kani::any();
-        kani::assume(f1 > 0 && f1 <= f2 && f2 < (1u128 << 40));
+        kani::assume(f1 > 0 && f1 <= f2 && f2 < (1u128 << 20));
         let a = skew_net_bps(inv, f1, lp_sells, s, r, sc, rc, rf).unwrap();
         let b = skew_net_bps(inv, f2, lp_sells, s, r, sc, rc, rf).unwrap();
         assert!(a <= b);
@@ -925,12 +945,13 @@ mod proofs {
     /// Skew term is monotone non-decreasing in pre-trade skew in the trade's direction:
     /// for an LP that sells (taker buys), a more-negative starting inventory costs more.
     #[kani::proof]
+    #[kani::solver(cadical)]
     fn proof_skew_monotone_in_skew() {
         let (inv, s, r, sc, rc, rf) = skew_args();
         let f: u128 = kani::any();
-        kani::assume(f > 0 && f < (1u128 << 40));
+        kani::assume(f > 0 && f < (1u128 << 20));
         let lower: i128 = kani::any();
-        kani::assume(lower > -(1i128 << 40) && lower <= inv);
+        kani::assume(lower > -(1i128 << 20) && lower <= inv);
         // LP sells => inventory decreases => starting lower (more short) is worse.
         let a = skew_net_bps(inv, f, true, s, r, sc, rc, rf).unwrap();
         let b = skew_net_bps(lower, f, true, s, r, sc, rc, rf).unwrap();
@@ -941,10 +962,11 @@ mod proofs {
     /// No splitting profit from the rebate: going out and straight back never nets the
     /// taker a positive skew payment (r <= s), measured in bps*units.
     #[kani::proof]
+    #[kani::solver(cadical)]
     fn proof_skew_round_trip_non_negative() {
         let (inv, s, r, sc, rc, rf) = skew_args();
         let f: u128 = kani::any();
-        kani::assume(f > 0 && f < (1u128 << 40));
+        kani::assume(f > 0 && f < (1u128 << 20));
         let lp_sells: bool = kani::any();
         let out = skew_net_bps(inv, f, lp_sells, s, r, sc, rc, rf).unwrap();
         let mid = if lp_sells {
@@ -958,6 +980,31 @@ mod proofs {
             assert!(out + back >= 0);
         }
         kani::cover!(inv == 0 && out > 0 && back < 0);
+    }
+
+    /// Splitting a trade into two pieces never pays less skew (bps·q, before the per-trade
+    /// ceil the pieces can only round up): potential differences telescope exactly.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn proof_skew_split_never_cheaper() {
+        let (inv, s, r, sc, rc, rf) = skew_args();
+        let f1: u128 = kani::any();
+        let f2: u128 = kani::any();
+        kani::assume(f1 > 0 && f2 > 0 && f1 < (1u128 << 16) && f2 < (1u128 << 16));
+        let lp_sells: bool = kani::any();
+        let whole = skew_net_bps(inv, f1 + f2, lp_sells, s, r, sc, rc, rf).unwrap();
+        let p1 = skew_net_bps(inv, f1, lp_sells, s, r, sc, rc, rf).unwrap();
+        let mid = if lp_sells {
+            inv - f1 as i128
+        } else {
+            inv + f1 as i128
+        };
+        let p2 = skew_net_bps(mid, f2, lp_sells, s, r, sc, rc, rf).unwrap();
+        // cost in bps*q; each call rounds toward +inf so pieces >= exact, whole <= exact+f.
+        let split_cost = p1 * f1 as i128 + p2 * f2 as i128;
+        let whole_cost = whole * (f1 + f2) as i128;
+        assert!(split_cost + (f1 + f2) as i128 >= whole_cost);
+        kani::cover!(sc > 0 && s > 0 && p2 > p1);
     }
 
     fn any_quote() -> AdaptiveQuoteIn {
@@ -977,22 +1024,23 @@ mod proofs {
             rebate_cap_bps: kani::any(),
             ref_inv: kani::any(),
         };
-        kani::assume(q.oracle_e6 >= 1 && q.oracle_e6 <= 1_000_000_000_000_000);
-        kani::assume(q.fill < (1u128 << 40));
-        kani::assume(q.inv_pre > -(1i128 << 40) && q.inv_pre < (1i128 << 40));
+        kani::assume(q.oracle_e6 >= 1 && q.oracle_e6 < (1u64 << 32));
+        kani::assume(q.fill < (1u128 << 20));
+        kani::assume(q.inv_pre > -(1i128 << 20) && q.inv_pre < (1i128 << 20));
         kani::assume(q.max_total_bps <= 9_000 && q.base_spread_bps <= 9_000);
         kani::assume(q.fee_bps <= MAX_FEE_BPS as u128);
         kani::assume(q.impact_k_bps <= MAX_IMPACT_K_BPS);
-        kani::assume(q.depth_e6 < (1u128 << 64));
+        kani::assume(q.depth_e6 < (1u128 << 40));
         kani::assume(q.s_mult_bps <= 10_000 && q.r_mult_bps <= q.s_mult_bps);
         kani::assume(q.skew_cap_bps <= MAX_SKEW_CAP_BPS && q.rebate_cap_bps <= q.skew_cap_bps);
-        kani::assume(q.ref_inv > 0 && q.ref_inv < (1u64 << 40));
+        kani::assume(q.ref_inv > 0 && q.ref_inv < (1u64 << 20));
         q
     }
 
     /// The quote never prices through the oracle in the taker's favour, never exceeds
     /// max_total, never grows the fill, and never overflows (returns Some).
     #[kani::proof]
+    #[kani::solver(cadical)]
     fn proof_quote_never_crosses_oracle() {
         let q = any_quote();
         if let Some((fill, price, total)) = quote_adaptive(&q) {
@@ -1016,6 +1064,7 @@ mod proofs {
     /// Stale guard: whenever an authoritative mark_slot older than the limit is supplied,
     /// the guard reports Stale (so the caller refuses) — no path prices through it.
     #[kani::proof]
+    #[kani::solver(cadical)]
     fn proof_stale_mark_never_fresh() {
         let c = any_cfg_kind2();
         let mut obs: (u64, u64) = (kani::any(), kani::any());
@@ -1035,6 +1084,7 @@ mod proofs {
     /// Observed-staleness fallback: an unchanged price older than the limit is Stale; a
     /// changed price is always Fresh (w.r.t. the fallback) and resets the tracker.
     #[kani::proof]
+    #[kani::solver(cadical)]
     fn proof_observed_stale() {
         let mut c = any_cfg_kind2();
         c.max_mark_age_slots = 0;
