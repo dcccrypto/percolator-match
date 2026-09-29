@@ -84,16 +84,22 @@ jobs:
           fi
 
   bpf:
-    name: build-sbf (the deployable artifact)
+    name: build-sbf (the deployable artifact) + LiteSVM
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # P2: the LiteSVM parity test rebuilds the DEPLOYED matcher (12bd671) as the
+          # byte-for-byte baseline, so the job needs full history.
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
       - name: install Solana toolchain (provides cargo-build-sbf)
         run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          # Pinned: the artifact sha256 recorded for review is built with 4.2.2; "stable"
+          # would silently change the bytes under a reviewer.
+          sh -c "$(curl -sSfL https://release.anza.xyz/v4.2.2/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
 
       - uses: Swatinem/rust-cache@v2
@@ -158,3 +164,17 @@ jobs:
             exit 1
           fi
           echo "matcher parity OK"
+
+      # P2 matcher v2: run the LiteSVM suite against the .so built above. It includes a
+      # v1-parity test (kinds 0/1, legacy calls must leave all 320 ctx bytes identical to the
+      # deployed 12bd671 program), so build that baseline from history first. The suite
+      # FAILS (not skips) if either .so is missing.
+      - name: build v1 baseline (12bd671) for parity
+        run: |
+          mkdir -p /tmp/v1-12bd671
+          git archive 12bd671 | tar -x -C /tmp/v1-12bd671
+          (cd /tmp/v1-12bd671 && cargo build-sbf)
+          echo "V1_SO=/tmp/v1-12bd671/target/deploy/percolator_match.so" >> "$GITHUB_ENV"
+
+      - name: LiteSVM suite (tests-litesvm/)
+        run: cargo test --manifest-path tests-litesvm/Cargo.toml -- --test-threads=1

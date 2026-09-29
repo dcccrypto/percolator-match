@@ -1206,3 +1206,28 @@ fn observed_fallback_yields_to_fresh_mark_slot() {
         ProgramError::Custom(ERR_STALE_MARK)
     );
 }
+
+/// LiteSVM finding D: with the fee saturated at fee_hi == max_total - base and impact on,
+/// every risk-INCREASING fill is zero-filled (intended circuit breaker), but an LP-reducing
+/// request must still fill up to |inventory|, priced at the max_total clamp.
+#[test]
+fn saturated_fee_blocks_increasing_but_not_lp_reducing() {
+    let mut c = kind2_plain(380); // base 20 + fee 380 == max_total 400
+    c.impact_k_bps = 10_000;
+    c.liquidity_notional_e6 = 1_000_000_000_000;
+    c.validate().unwrap();
+    c.inventory_base = 500; // LP long
+    let e = CallExt::default();
+    // taker SELL => LP buys more => increasing: zero-fill (control)
+    let inc = execute_leg(&mut c.clone(), &call(PX, -100), &e, Some(1), 0).unwrap();
+    assert_eq!(inc.exec_size, 0);
+    // taker BUY => LP sells => reducing: fills, capped at |inventory|, priced at the clamp
+    let red = execute_leg(&mut c.clone(), &call(PX, 800), &e, Some(1), 0).unwrap();
+    assert_eq!(red.exec_size, 500);
+    assert_eq!(red.flags & FLAG_PARTIAL_OK, FLAG_PARTIAL_OK);
+    assert_eq!(red.exec_price_e6, PX + PX * 400 / 10_000);
+    // and never flips
+    let mut cc = c;
+    apply_fill(&mut cc, &red, PX).unwrap();
+    assert_eq!(cc.inventory_base, 0);
+}

@@ -760,10 +760,22 @@ pub fn quote_adaptive(q: &AdaptiveQuoteIn) -> Option<(u128, u64, u128)> {
         }
         lo
     };
+    // A request that REDUCES the LP's |inventory| is always fillable up to |inventory|
+    // (priced at the max_total clamp if it must be): the size clip exists to stop the LP
+    // loading up, not to trap exits when the adaptive fee saturates in volatility
+    // (LiteSVM finding D). max() of two request-monotone terms stays monotone.
+    let lp_reduces = (q.taker_buys && q.inv_pre > 0) || (!q.taker_buys && q.inv_pre < 0);
+    let fill = if lp_reduces {
+        fill.max(q.fill.min(q.inv_pre.unsigned_abs()))
+    } else {
+        fill
+    };
     if fill == 0 {
         return Some((0, q.oracle_e6, 0));
     }
     let (impact, skew) = impact_and_skew(q, fill)?;
+    // An exempt reducing fill can reach the depth (infinite impact); the clamp prices it.
+    let impact = impact.min(9_000);
     let gross = (q.base_spread_bps as u128 + q.fee_bps + impact) as i128 + skew;
     // Never below 0 (price never crosses the oracle in the taker's favour), never above
     // max_total.
