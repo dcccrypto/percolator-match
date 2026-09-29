@@ -21,10 +21,13 @@ fn cfg(lo: u16, hi: u16, a: u16, b: u16) -> V2Config {
 
 prop_compose! {
     fn skew_params()(s in 0u16..=10_000, rf in 0u16..=10_000, sc in 0u16..=5_000,
-                     rcf in 0u16..=10_000, ref_inv in 1u64..=1_000_000_000_000)
+                     rcf in 0u16..=10_000, ref_sel in 0u8..4, ref_small in 1u64..=1_000_000_000_000, ref_any in 1u64..=u64::MAX)
         -> (u16, u16, u16, u16, u64) {
         let r = (s as u32 * rf as u32 / 10_000) as u16;          // r <= s
         let rc = (sc as u32 * rcf as u32 / 10_000) as u16;       // rc <= sc
+        // full u64 domain incl. the u64::MAX default used when max_inventory_abs == 0
+        // (security review: the shipped default sits outside the Kani-proven domain)
+        let ref_inv = match ref_sel { 0 => u64::MAX, 1 => ref_any, _ => ref_small };
         (s, r, sc, rc, ref_inv)
     }
 }
