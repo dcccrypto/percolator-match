@@ -7,12 +7,15 @@
 //! Mirrors the pattern in percolator-prog, percolator-stake, and percolator-nft.
 
 use percolator_match::vamm::{
-    MatcherCtx, MatcherKind, INIT_CTX_LEN, MATCHER_MAGIC, MATCHER_VERSION,
+    MatcherCtx, MatcherKind, CONFIGURE_BACKING_FEE_CAP_LEN, INIT_CTX_LEN, MATCHER_MAGIC,
+    MATCHER_VERSION,
 };
 use percolator_match::{
-    CTX_RETURN_OFFSET, CTX_VAMM_LEN, CTX_VAMM_OFFSET, FLAG_PARTIAL_OK, FLAG_REJECTED, FLAG_VALID,
-    MATCHER_ABI_VERSION, MATCHER_BATCH_CALL_TAG, MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN,
-    MATCHER_BATCH_MAX_LEGS, MATCHER_CALL_LEN, MATCHER_CALL_TAG, MATCHER_CONTEXT_LEN,
+    BACKING_FEE_CAP_BPS_MAX, CTX_BACKING_FEE_CAP_OFFSET, CTX_RETURN_OFFSET, CTX_VAMM_LEN,
+    CTX_VAMM_OFFSET, FLAG_BACKING_FEE_CAP_MASK, FLAG_BACKING_FEE_CAP_SHIFT, FLAG_PARTIAL_OK,
+    FLAG_REJECTED, FLAG_VALID, MATCHER_ABI_VERSION, MATCHER_BATCH_CALL_TAG,
+    MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS, MATCHER_CALL_LEN,
+    MATCHER_CALL_TAG, MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG, MATCHER_CONTEXT_LEN,
     MATCHER_INIT_VAMM_TAG, MATCHER_RETURN_LEN,
 };
 use serde_json::json;
@@ -42,7 +45,10 @@ fn main() {
         "_new_pad":                 156,
         "lp_account_id":            160,
         "insurance_fee_remainder_e6": 168,
-        "_reserved":                176,
+        // sync/v16-migration-backing-fee-cap: carved from what was an 80-byte
+        // _reserved block. backing_fee_cap_bps now occupies 176..178.
+        "backing_fee_cap_bps":      176,
+        "_reserved":                178,
     });
 
     // MatcherReturn field offsets (written at CTX_RETURN_OFFSET in context account)
@@ -84,16 +90,32 @@ fn main() {
         "lp_account_id":            70,
     });
 
+    // ConfigureBackingFeeCap instruction data field offsets (tag=4 instruction)
+    // sync/v16-migration-backing-fee-cap
+    let configure_backing_fee_cap_field_offsets = json!({
+        "tag":                  0,
+        "backing_fee_cap_bps":  1,
+    });
+
     let tags = [
         ("MatcherCall", MATCHER_CALL_TAG as u32),
         ("InitMatcherCtx", MATCHER_INIT_VAMM_TAG as u32),
         ("BatchMatcherCall", MATCHER_BATCH_CALL_TAG as u32),
+        (
+            "ConfigureBackingFeeCap",
+            MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG as u32,
+        ),
     ];
 
     let flags = json!({
         "FLAG_VALID":       FLAG_VALID,
         "FLAG_PARTIAL_OK":  FLAG_PARTIAL_OK,
         "FLAG_REJECTED":    FLAG_REJECTED,
+        // sync/v16-migration-backing-fee-cap: bits 8..21 of MatcherReturn.flags,
+        // matching percolator-prog matcher_abi::FLAG_BACKING_FEE_CAP_SHIFT/_MASK
+        // exactly (verified against sync/integration-v16 @ a9318945).
+        "FLAG_BACKING_FEE_CAP_SHIFT": FLAG_BACKING_FEE_CAP_SHIFT,
+        "FLAG_BACKING_FEE_CAP_MASK":  FLAG_BACKING_FEE_CAP_MASK,
     });
 
     let sizes = json!({
@@ -108,6 +130,9 @@ fn main() {
         "MATCHER_BATCH_HEADER_LEN": MATCHER_BATCH_HEADER_LEN,
         "MATCHER_BATCH_LEG_LEN":    MATCHER_BATCH_LEG_LEN,
         "MATCHER_BATCH_MAX_LEGS":   MATCHER_BATCH_MAX_LEGS,
+        // sync/v16-migration-backing-fee-cap
+        "CTX_BACKING_FEE_CAP_OFFSET":       CTX_BACKING_FEE_CAP_OFFSET,
+        "CONFIGURE_BACKING_FEE_CAP_LEN":    CONFIGURE_BACKING_FEE_CAP_LEN,
         // Rust struct size — must equal CTX_VAMM_LEN
         "MatcherCtx_size":          std::mem::size_of::<MatcherCtx>(),
     });
@@ -119,6 +144,8 @@ fn main() {
         "MATCHER_MAGIC_hex":    format!("{:#018x}", MATCHER_MAGIC),
         "MATCHER_KIND_PASSIVE": MatcherKind::Passive as u8,
         "MATCHER_KIND_VAMM":    MatcherKind::Vamm as u8,
+        // sync/v16-migration-backing-fee-cap
+        "BACKING_FEE_CAP_BPS_MAX": BACKING_FEE_CAP_BPS_MAX,
     });
 
     // Self-check: emit compile-time assertions as boolean — these should all be true.
@@ -129,6 +156,10 @@ fn main() {
         "vamm_offset_plus_vamm_len_eq_context_len": CTX_VAMM_OFFSET + CTX_VAMM_LEN == MATCHER_CONTEXT_LEN,
         "init_ctx_len_eq_78":                    INIT_CTX_LEN == 78,
         "matcher_call_len_eq_67":                MATCHER_CALL_LEN == 67,
+        // sync/v16-migration-backing-fee-cap
+        "ctx_backing_fee_cap_offset_eq_ctx_vamm_offset_plus_176":
+            CTX_BACKING_FEE_CAP_OFFSET == CTX_VAMM_OFFSET + 176,
+        "configure_backing_fee_cap_len_eq_3":    CONFIGURE_BACKING_FEE_CAP_LEN == 3,
     });
 
     let payload = json!({
@@ -144,6 +175,7 @@ fn main() {
         "return_field_offsets": return_field_offsets,
         "call_field_offsets": call_field_offsets,
         "init_field_offsets": init_field_offsets,
+        "configure_backing_fee_cap_field_offsets": configure_backing_fee_cap_field_offsets,
         "self_checks": self_checks,
     });
 

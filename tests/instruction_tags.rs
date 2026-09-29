@@ -5,7 +5,8 @@
 
 use percolator_match::{
     MATCHER_ABI_VERSION, MATCHER_BATCH_CALL_TAG, MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN,
-    MATCHER_BATCH_MAX_LEGS, MATCHER_CALL_TAG, MATCHER_INIT_VAMM_TAG,
+    MATCHER_BATCH_MAX_LEGS, MATCHER_CALL_TAG, MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG,
+    MATCHER_INIT_VAMM_TAG,
 };
 
 // ---------------------------------------------------------------------------
@@ -88,6 +89,24 @@ fn tag_1_is_unassigned() {
     assert_ne!(MATCHER_CALL_TAG, 1u8);
     assert_ne!(MATCHER_INIT_VAMM_TAG, 1u8);
     assert_ne!(MATCHER_BATCH_CALL_TAG, 1u8);
+    assert_ne!(MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG, 1u8);
+}
+
+#[test]
+fn tag_configure_backing_fee_cap_is_4() {
+    // sync/v16-migration-backing-fee-cap: tag 4 is the LP-settable config
+    // instruction that sets MatcherCtx::backing_fee_cap_bps, signed by lp_pda.
+    assert_eq!(
+        MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG, 4u8,
+        "MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG must be 4 — breaking change"
+    );
+    // Must not collide with any existing tag.
+    assert_ne!(MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG, MATCHER_CALL_TAG);
+    assert_ne!(MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG, MATCHER_INIT_VAMM_TAG);
+    assert_ne!(
+        MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG,
+        MATCHER_BATCH_CALL_TAG
+    );
 }
 
 // ---------------------------------------------------------------------------

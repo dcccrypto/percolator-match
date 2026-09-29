@@ -44,7 +44,8 @@ fn vamm_ctx(
         _new_pad: [0; 4],
         lp_account_id: 42,
         insurance_fee_remainder_e6: 0,
-        _reserved: [0; 80],
+        backing_fee_cap_bps: 0,
+        _reserved: [0; 78],
     }
 }
 
@@ -76,7 +77,8 @@ fn passive_ctx(
         _new_pad: [0; 4],
         lp_account_id: 42,
         insurance_fee_remainder_e6: 0,
-        _reserved: [0; 80],
+        backing_fee_cap_bps: 0,
+        _reserved: [0; 78],
     }
 }
 
@@ -547,6 +549,9 @@ fn matcher_kind_roundtrip() {
     use percolator_match::vamm::MatcherKind;
     assert_eq!(MatcherKind::try_from(0u8).unwrap(), MatcherKind::Passive);
     assert_eq!(MatcherKind::try_from(1u8).unwrap(), MatcherKind::Vamm);
-    assert!(MatcherKind::try_from(2u8).is_err());
+    // P2 (matcher v2) assigns kind 2 = Adaptive. Edited, not weakened: the rejection
+    // boundary moves from 2 to 3 and is still asserted, plus 255.
+    assert_eq!(MatcherKind::try_from(2u8).unwrap(), MatcherKind::Adaptive);
+    assert!(MatcherKind::try_from(3u8).is_err());
     assert!(MatcherKind::try_from(255u8).is_err());
 }

@@ -6,15 +6,18 @@
 //! 3. Kani formal verification proofs (impact overflow, inventory limits, insurance fee)
 
 use solana_program::{
-    account_info::AccountInfo, entrypoint::ProgramResult, program_error::ProgramError,
+    account_info::{next_account_info, AccountInfo},
+    entrypoint::ProgramResult,
+    program_error::ProgramError,
     pubkey::Pubkey,
 };
 
+use crate::v2::{self, CallExt, MarkState, V2Block, V2Config};
 use crate::{
-    MatcherCall, MatcherReturn, CTX_VAMM_LEN, CTX_VAMM_OFFSET, ERR_INCONSISTENT_LEG_ORACLE_PRICE,
-    FLAG_PARTIAL_OK, FLAG_VALID, MATCHER_ABI_VERSION, MATCHER_BATCH_HEADER_LEN,
-    MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS, MATCHER_CONTEXT_LEN, MATCHER_RETURN_LEN,
-    ORACLE_PRICE_E6_MAX,
+    MatcherCall, MatcherReturn, BACKING_FEE_CAP_BPS_MAX, CTX_VAMM_LEN, CTX_VAMM_OFFSET,
+    ERR_INCONSISTENT_LEG_ORACLE_PRICE, FLAG_PARTIAL_OK, FLAG_VALID, MATCHER_ABI_VERSION,
+    MATCHER_BATCH_HEADER_LEN, MATCHER_BATCH_LEG_LEN, MATCHER_BATCH_MAX_LEGS, MATCHER_CONTEXT_LEN,
+    MATCHER_RETURN_LEN, ORACLE_PRICE_E6_MAX,
 };
 
 // =============================================================================
@@ -26,6 +29,10 @@ use crate::{
 pub enum MatcherKind {
     Passive = 0,
     Vamm = 1,
+    /// P2 matcher v2: adaptive fee + constant-product impact + skew surcharge /
+    /// thin-side rebate + stale-mark refusal. Config/state in the v2 block
+    /// (`crate::v2::V2Block`, ctx offsets 178..256).
+    Adaptive = 2,
 }
 
 impl TryFrom<u8> for MatcherKind {
@@ -34,6 +41,7 @@ impl TryFrom<u8> for MatcherKind {
         match value {
             0 => Ok(MatcherKind::Passive),
             1 => Ok(MatcherKind::Vamm),
+            2 => Ok(MatcherKind::Adaptive),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -73,7 +81,8 @@ pub const MATCHER_VERSION: u32 = 4; // Bumped from 3 for new fields
 /// 156     4     _new_pad
 /// 160     8     lp_account_id (numeric LP identifier, must match instruction data)
 /// 168     8     insurance_fee_remainder_e6 (fractional insurance fee carried across calls)
-/// 176     80    _reserved
+/// 176     2     backing_fee_cap_bps (sync/v16-migration-backing-fee-cap, carved from reserved)
+/// 178     78    _reserved
 /// ```
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -125,8 +134,18 @@ pub struct MatcherCtx {
     /// `compute_insurance_fee`.
     pub insurance_fee_remainder_e6: u64, // 8 bytes, offset 168
 
-    // Reserved (80 bytes)
-    pub _reserved: [u8; 80],
+    /// sync/v16-migration-backing-fee-cap: this matcher's self-declared cap (bps,
+    /// 0..=10_000, see `BACKING_FEE_CAP_BPS_MAX`) on how much backing-domain fee it
+    /// consents to being charged via CPI-filled trades. Emitted in every
+    /// `MatcherReturn.flags` bits 8..21 (`FLAG_BACKING_FEE_CAP_MASK`) by
+    /// `process_call`/`process_batch_call`. Defaults to 0 (init and `Default` both
+    /// zero it), which the wrapper treats as "consent not given" and fails closed
+    /// on any nonzero backing-domain fee until `process_configure_backing_fee_cap`
+    /// (tag `MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG`) has set it, signed by `lp_pda`.
+    pub backing_fee_cap_bps: u16, // 2 bytes, offset 176
+
+    // Reserved (78 bytes — was 80; 2 bytes carved above for backing_fee_cap_bps)
+    pub _reserved: [u8; 78],
 }
 
 const _: () = assert!(core::mem::size_of::<MatcherCtx>() == CTX_VAMM_LEN);
@@ -155,7 +174,8 @@ impl Default for MatcherCtx {
             _new_pad: [0; 4],
             lp_account_id: 0,
             insurance_fee_remainder_e6: 0,
-            _reserved: [0; 80],
+            backing_fee_cap_bps: 0,
+            _reserved: [0; 78],
         }
     }
 }
@@ -179,8 +199,8 @@ impl MatcherCtx {
 
         let mut lp_pda = [0u8; 32];
         lp_pda.copy_from_slice(&data[16..48]);
-        let mut reserved = [0u8; 80];
-        reserved.copy_from_slice(&data[176..256]);
+        let mut reserved = [0u8; 78];
+        reserved.copy_from_slice(&data[178..256]);
 
         Ok(Self {
             magic,
@@ -204,6 +224,7 @@ impl MatcherCtx {
             _new_pad: [0; 4],
             lp_account_id: u64::from_le_bytes(data[160..168].try_into().unwrap()),
             insurance_fee_remainder_e6: u64::from_le_bytes(data[168..176].try_into().unwrap()),
+            backing_fee_cap_bps: u16::from_le_bytes(data[176..178].try_into().unwrap()),
             _reserved: reserved,
         })
     }
@@ -233,7 +254,8 @@ impl MatcherCtx {
         data[156..160].copy_from_slice(&self._new_pad);
         data[160..168].copy_from_slice(&self.lp_account_id.to_le_bytes());
         data[168..176].copy_from_slice(&self.insurance_fee_remainder_e6.to_le_bytes());
-        data[176..256].copy_from_slice(&self._reserved);
+        data[176..178].copy_from_slice(&self.backing_fee_cap_bps.to_le_bytes());
+        data[178..256].copy_from_slice(&self._reserved);
         Ok(())
     }
 
@@ -294,7 +316,41 @@ impl MatcherCtx {
         if self.skew_spread_mult_bps > 10_000 {
             return Err(ProgramError::InvalidAccountData);
         }
+        // sync/v16-migration-backing-fee-cap: mirror the wrapper's own bound
+        // (`ret.backing_fee_cap_bps() > 10_000` in `validate_matcher_return`) on the
+        // stored config value, so an out-of-range cap can never reach process_call /
+        // process_batch_call and be encoded into a MatcherReturn in the first place.
+        if self.backing_fee_cap_bps > BACKING_FEE_CAP_BPS_MAX {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // P2: a kind-2 context MUST carry a valid v2 block; a kind-0/1 context MAY carry
+        // one (stale guard / binding only). All-zero reserved bytes == no block == v1.
+        match V2Block::decode(&self._reserved) {
+            Some(b) => v2::validate_config(
+                &b.cfg,
+                self.kind,
+                self.base_spread_bps,
+                self.max_total_bps,
+                self.skew_spread_mult_bps,
+                self.impact_k_bps,
+                self.liquidity_notional_e6,
+            )?,
+            None => {
+                if kind == MatcherKind::Adaptive || self._reserved.iter().any(|&b| b != 0) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The v2 block, if this context carries one.
+    pub fn v2_block(&self) -> Option<V2Block> {
+        V2Block::decode(&self._reserved)
+    }
+
+    pub fn set_v2_block(&mut self, b: &V2Block) {
+        self._reserved = b.encode();
     }
 }
 
@@ -457,7 +513,7 @@ pub fn process_init(
     let max_fill_clamped = core::cmp::min(params.max_fill_abs, i128::MAX as u128);
     let max_inv_clamped = core::cmp::min(params.max_inventory_abs, i128::MAX as u128);
 
-    let ctx = MatcherCtx {
+    let mut ctx = MatcherCtx {
         magic: MATCHER_MAGIC,
         version: MATCHER_VERSION,
         kind: params.kind,
@@ -479,8 +535,127 @@ pub fn process_init(
         _new_pad: [0; 4],
         lp_account_id: params.lp_account_id,
         insurance_fee_remainder_e6: 0,
-        _reserved: [0; 80],
+        // sync/v16-migration-backing-fee-cap: not part of InitParams — an LP opts
+        // into a nonzero backing-domain fee cap via process_configure_backing_fee_cap
+        // (tag MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG) after init, not at init time.
+        // Starts at 0, which is fail-closed from the wrapper's perspective.
+        backing_fee_cap_bps: 0,
+        _reserved: [0; 78],
     };
+    // P2: the fixed 78-byte tag-2 payload (the only thing wrapper tag 83 can send) has no
+    // room for v2 config, so a kind-2 context starts from conservative defaults derived
+    // from its core params. The LP owner retunes them with tag 5. Kinds 0/1 keep an
+    // all-zero reserved area, i.e. they are byte-identical to a v1-created context.
+    if params.kind == MatcherKind::Adaptive as u8 {
+        let cfg = v2::default_config_for_kind2(
+            params.trading_fee_bps,
+            params.base_spread_bps,
+            params.max_total_bps,
+            params.skew_spread_mult_bps,
+            max_inv_clamped,
+        );
+        ctx.set_v2_block(&V2Block::fresh(cfg));
+    }
+    ctx.validate()?;
+
+    let mut data = ctx_account.try_borrow_mut_data()?;
+    ctx.write_to(&mut data[CTX_VAMM_OFFSET..])?;
+    Ok(())
+}
+
+// =============================================================================
+// Configure Backing Fee Cap Instruction (Tag 4) — sync/v16-migration-backing-fee-cap
+// =============================================================================
+
+/// Wire size of the ConfigureBackingFeeCap instruction data: tag(1) + backing_fee_cap_bps
+/// u16 LE (2) = 3 bytes.
+pub const CONFIGURE_BACKING_FEE_CAP_LEN: usize = 3;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ConfigureBackingFeeCapParams {
+    /// bps, 0..=BACKING_FEE_CAP_BPS_MAX (10_000). The cap this matcher's LP
+    /// consents to having charged as a backing-domain fee on CPI-filled trades.
+    pub backing_fee_cap_bps: u16,
+}
+
+impl ConfigureBackingFeeCapParams {
+    pub fn parse(data: &[u8]) -> Result<Self, ProgramError> {
+        if data.len() != CONFIGURE_BACKING_FEE_CAP_LEN {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if data[0] != crate::MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Ok(Self {
+            backing_fee_cap_bps: u16::from_le_bytes(data[1..3].try_into().unwrap()),
+        })
+    }
+
+    pub fn encode(&self) -> [u8; CONFIGURE_BACKING_FEE_CAP_LEN] {
+        let mut data = [0u8; CONFIGURE_BACKING_FEE_CAP_LEN];
+        data[0] = crate::MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG;
+        data[1..3].copy_from_slice(&self.backing_fee_cap_bps.to_le_bytes());
+        data
+    }
+}
+
+/// Process Configure Backing Fee Cap instruction (Tag 4).
+///
+/// Lets the LP that owns a matcher context opt in to a nonzero backing-domain fee
+/// cap, so the wrapper (percolator-prog `sync/w2-e24cf78e`, "require matcher
+/// consent for CPI backing fees") can stop failing closed on this matcher's CPI
+/// trades. Modeled on `process_init`'s auth: the `lp_pda` PDA must sign, and (once
+/// the context is initialized) must match the `lp_pda` stored at init — the same
+/// signer chain every other instruction in this program relies on.
+///
+/// Accounts:
+///   0. `[signer]`   lp_pda      — must equal `ctx.lp_pda`
+///   1. `[writable]` ctx_account — owned by this program, already initialized
+///
+/// Data: tag(1) = MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG | backing_fee_cap_bps: u16 LE (2)
+pub fn process_configure_backing_fee_cap(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+    let lp_pda = next_account_info(account_iter)?;
+    let ctx_account = next_account_info(account_iter)?;
+
+    if ctx_account.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if ctx_account.data_len() < MATCHER_CONTEXT_LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    // Mirror the writable + signer discipline from process_init/process_call: signer
+    // check before any account-data inspection (PM-3 pattern) so an unauthenticated
+    // caller can't distinguish initialized from uninitialized contexts, or writable
+    // from non-writable ones, via error-code observation.
+    if !ctx_account.is_writable {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if !lp_pda.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let params = ConfigureBackingFeeCapParams::parse(instruction_data)?;
+    if params.backing_fee_cap_bps > BACKING_FEE_CAP_BPS_MAX {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut ctx = {
+        let data = ctx_account.try_borrow_data()?;
+        MatcherCtx::read_from(&data[CTX_VAMM_OFFSET..])?
+    };
+    ctx.validate()?;
+
+    // Only the LP that owns this context can (re)configure its own cap.
+    if lp_pda.key.to_bytes() != ctx.lp_pda {
+        return Err(ProgramError::InvalidAccountData);
+    }
+
+    ctx.backing_fee_cap_bps = params.backing_fee_cap_bps;
     ctx.validate()?;
 
     let mut data = ctx_account.try_borrow_mut_data()?;
@@ -493,7 +668,26 @@ pub fn process_call(
     ctx_account: &AccountInfo,
     instruction_data: &[u8],
 ) -> ProgramResult {
+    process_call_with_clock(lp_pda, ctx_account, instruction_data, clock_slot)
+}
+
+/// Current slot from the Clock sysvar (syscall; no account needed).
+pub fn clock_slot() -> Result<u64, ProgramError> {
+    use solana_program::sysvar::Sysvar;
+    Ok(solana_program::clock::Clock::get()?.slot)
+}
+
+/// `process_call` with an injectable slot source, so native unit tests can drive the v2
+/// time-dependent paths. The slot source is only invoked when the context carries a v2
+/// block (legacy contexts never touch the Clock, exactly as in v1).
+pub fn process_call_with_clock(
+    lp_pda: &AccountInfo,
+    ctx_account: &AccountInfo,
+    instruction_data: &[u8],
+    slot_source: fn() -> Result<u64, ProgramError>,
+) -> ProgramResult {
     let call = MatcherCall::parse(instruction_data)?;
+    let ext = MatcherCall::parse_ext(instruction_data)?;
 
     if call.oracle_price_e6 == 0 {
         return Err(ProgramError::InvalidInstructionData);
@@ -534,29 +728,13 @@ pub fn process_call(
         return Err(ProgramError::InvalidInstructionData);
     }
 
-    let (exec_price, exec_size, flags) = compute_execution(&ctx, &call)?;
-
-    if exec_size != 0 {
-        // 3E.3: Use checked_sub to surface underflow rather than silently saturating.
-        ctx.inventory_base = ctx
-            .inventory_base
-            .checked_sub(exec_size)
-            .ok_or(ProgramError::ArithmeticOverflow)?;
-        ctx.last_oracle_price_e6 = call.oracle_price_e6;
-        ctx.last_exec_price_e6 = exec_price;
-
-        // Accrue insurance fee
-        if ctx.fee_to_insurance_bps > 0 {
-            let (insurance_fee, remainder) = compute_insurance_fee(&ctx, exec_size, exec_price);
-            // PERC-321: Use checked_add to detect overflow instead of silently
-            // saturating (which would lose insurance fees at u64::MAX).
-            ctx.insurance_accrued_e6 = ctx
-                .insurance_accrued_e6
-                .checked_add(insurance_fee)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
-            ctx.insurance_fee_remainder_e6 = remainder;
-        }
-    }
+    let now = if ctx.v2_block().is_some() {
+        Some(slot_source()?)
+    } else {
+        None
+    };
+    let out = execute_leg(&mut ctx, &call, &ext, now, 0)?;
+    apply_fill(&mut ctx, &out, call.oracle_price_e6)?;
 
     {
         let mut data = ctx_account.try_borrow_mut_data()?;
@@ -565,18 +743,244 @@ pub fn process_call(
 
     let ret = MatcherReturn {
         abi_version: crate::MATCHER_ABI_VERSION,
-        flags,
-        exec_price_e6: exec_price,
-        exec_size,
+        flags: out.flags,
+        exec_price_e6: out.exec_price_e6,
+        exec_size: out.exec_size,
         req_id: call.req_id,
         lp_account_id: call.lp_account_id,
         oracle_price_e6: call.oracle_price_e6,
         asset_index: call.asset_index as u64,
-    };
+    }
+    // sync/v16-migration-backing-fee-cap: carry this LP's configured cap through to
+    // the wrapper on every fill so it stops failing closed. `ctx.backing_fee_cap_bps`
+    // is already bounded to <= BACKING_FEE_CAP_BPS_MAX by validate() above, and the
+    // builder masks to FLAG_BACKING_FEE_CAP_MASK regardless, so this can never touch
+    // flags::FLAG_VALID / FLAG_PARTIAL_OK / FLAG_REJECTED.
+    .with_backing_fee_cap_bps(ctx.backing_fee_cap_bps);
+    let ret = with_fee_request(ret, &ext, call.oracle_price_e6);
 
     let mut data = ctx_account.try_borrow_mut_data()?;
     ret.write_to(&mut data)?;
     Ok(())
+}
+
+/// P2: attach the requested taker fee iff the wrapper negotiated it and the leg filled.
+pub fn with_fee_request(ret: MatcherReturn, ext: &CallExt, oracle_price_e6: u64) -> MatcherReturn {
+    if ext.accepts_fee_request && ret.exec_size != 0 {
+        ret.with_requested_fee_bps(v2::requested_fee_bps(oracle_price_e6, ret.exec_price_e6))
+    } else {
+        ret
+    }
+}
+
+/// Result of pricing one leg.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LegOut {
+    pub exec_price_e6: u64,
+    pub exec_size: i128,
+    pub flags: u32,
+    /// Trading fee (bps) that priced this leg: `trading_fee_bps` for kinds 0/1, the
+    /// adaptive fee for kind 2. Used for the insurance slice.
+    pub fee_bps: u32,
+}
+
+/// Commit a priced leg into the context: inventory, last prices, insurance accrual.
+/// Identical to the v1 in-line update in process_call / process_batch_call, except that
+/// the insurance slice uses the fee that actually priced the leg.
+pub fn apply_fill(
+    ctx: &mut MatcherCtx,
+    out: &LegOut,
+    oracle_price_e6: u64,
+) -> Result<(), ProgramError> {
+    if out.exec_size == 0 {
+        return Ok(());
+    }
+    // 3E.3: Use checked_sub to surface underflow rather than silently saturating.
+    ctx.inventory_base = ctx
+        .inventory_base
+        .checked_sub(out.exec_size)
+        .ok_or(ProgramError::ArithmeticOverflow)?;
+    ctx.last_oracle_price_e6 = oracle_price_e6;
+    ctx.last_exec_price_e6 = out.exec_price_e6;
+    if ctx.fee_to_insurance_bps > 0 {
+        let mut fee_ctx = *ctx;
+        fee_ctx.trading_fee_bps = out.fee_bps;
+        let (insurance_fee, remainder) =
+            compute_insurance_fee(&fee_ctx, out.exec_size, out.exec_price_e6);
+        // PERC-321: Use checked_add to detect overflow instead of silently
+        // saturating (which would lose insurance fees at u64::MAX).
+        ctx.insurance_accrued_e6 = ctx
+            .insurance_accrued_e6
+            .checked_add(insurance_fee)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        ctx.insurance_fee_remainder_e6 = remainder;
+    }
+    Ok(())
+}
+
+/// Price one leg (single call or one batch leg) and advance v2 state (estimator, observed
+/// mark tracker, asset binding). Does NOT touch inventory — see [`apply_fill`].
+///
+/// * Legacy context (no v2 block), legacy call extension, kind 0/1: exactly v1's
+///   `compute_execution` — no clock, no state change.
+/// * `ext.headroom_q`: fill is clipped to `headroom - headroom_used` (zero-fill at 0).
+/// * v2 block: asset binding (kind 2 / observed staleness), stale-mark refusal
+///   (`ERR_STALE_MARK`), then kind-specific pricing.
+///
+/// `now_slot` must be `Some` whenever the context carries a v2 block.
+pub fn execute_leg(
+    ctx: &mut MatcherCtx,
+    call: &MatcherCall,
+    ext: &CallExt,
+    now_slot: Option<u64>,
+    headroom_used: u128,
+) -> Result<LegOut, ProgramError> {
+    let kind = ctx.get_kind()?;
+    let mut block = ctx.v2_block();
+    if block.is_none() && ext.is_legacy() && kind != MatcherKind::Adaptive {
+        let (p, sz, fl) = compute_execution(ctx, call)?;
+        return Ok(LegOut {
+            exec_price_e6: p,
+            exec_size: sz,
+            flags: fl,
+            fee_bps: ctx.trading_fee_bps,
+        });
+    }
+
+    // Effective limits for this leg (headroom and stale-reducing clips go here, so the
+    // unmodified v1 pricing functions see them as an ordinary max_fill_abs).
+    let mut eff = *ctx;
+    if let Some(band) = ext.exec_band_bps {
+        // Price inside the wrapper's exec band (P1): kinds 0/1 clamp their spread at
+        // max_total; kind 2 clips size to stay within it.
+        eff.max_total_bps = eff.max_total_bps.min(band as u32);
+    }
+    if let Some(h) = ext.headroom_q {
+        let rem = (h as u128).saturating_sub(headroom_used);
+        if eff.max_fill_abs > rem {
+            eff.max_fill_abs = rem;
+        }
+    }
+
+    let is_buy = call.req_size > 0;
+    if let Some(b) = block.as_mut() {
+        let now = now_slot.ok_or(ProgramError::UnsupportedSysvar)?;
+        let needs_bind = kind == MatcherKind::Adaptive || b.cfg.observed_stale_slots > 0;
+        if needs_bind {
+            let want = (call.asset_index as u32 + 1) as u16;
+            if b.st.bound_asset_plus1 == 0 {
+                b.st.bound_asset_plus1 = want;
+            } else if b.st.bound_asset_plus1 != want {
+                return Err(ProgramError::Custom(v2::ERR_ASSET_MISMATCH));
+            }
+        }
+        let mut obs = (b.st.obs_price_e6, b.st.obs_since_slot);
+        match v2::mark_state(&b.cfg, &mut obs, ext.mark_slot, call.oracle_price_e6, now) {
+            MarkState::Fresh => {}
+            MarkState::FutureSlot => {
+                return Err(ProgramError::Custom(v2::ERR_MARK_SLOT_IN_FUTURE));
+            }
+            MarkState::Stale => {
+                let allow = b.cfg.flags & v2::V2_FLAG_STALE_ALLOW_REDUCING != 0;
+                // Buy from user => LP sells => inventory decreases.
+                let inv = ctx.inventory_base;
+                let lp_reduces = (is_buy && inv > 0) || (!is_buy && inv < 0);
+                if allow && ext.taker_reducing {
+                    // Wrapper-attested exit of the taker's own position: let it through
+                    // unclipped (the wrapper bounds it by the taker's position).
+                } else if allow && lp_reduces {
+                    let cap = inv.unsigned_abs();
+                    if eff.max_fill_abs > cap {
+                        eff.max_fill_abs = cap;
+                    }
+                } else {
+                    return Err(ProgramError::Custom(v2::ERR_STALE_MARK));
+                }
+            }
+        }
+        b.st.obs_price_e6 = obs.0;
+        b.st.obs_since_slot = obs.1;
+    }
+
+    let out = match kind {
+        MatcherKind::Passive | MatcherKind::Vamm => {
+            let (p, sz, fl) = compute_execution(&eff, call)?;
+            LegOut {
+                exec_price_e6: p,
+                exec_size: sz,
+                flags: fl,
+                fee_bps: ctx.trading_fee_bps,
+            }
+        }
+        MatcherKind::Adaptive => {
+            let b = block.as_mut().ok_or(ProgramError::InvalidAccountData)?;
+            let now = now_slot.ok_or(ProgramError::UnsupportedSysvar)?;
+            v2::vol_update(&b.cfg, &mut b.st, call.oracle_price_e6, now);
+            let fee = v2::adaptive_fee_bps(&b.cfg, &b.st);
+            compute_adaptive_execution(&eff, call, &b.cfg, fee)?
+        }
+    };
+    if let Some(b) = block {
+        ctx.set_v2_block(&b);
+    }
+    Ok(out)
+}
+
+fn compute_adaptive_execution(
+    eff: &MatcherCtx,
+    call: &MatcherCall,
+    cfg: &V2Config,
+    fee_bps: u128,
+) -> Result<LegOut, ProgramError> {
+    let req_abs = call.req_size.unsigned_abs();
+    let is_buy = call.req_size > 0;
+    let zero = LegOut {
+        exec_price_e6: call.oracle_price_e6,
+        exec_size: 0,
+        flags: FLAG_VALID | FLAG_PARTIAL_OK,
+        fee_bps: fee_bps as u32,
+    };
+    let fill_abs = if eff.max_fill_abs == 0 {
+        0u128
+    } else {
+        core::cmp::min(req_abs, eff.max_fill_abs)
+    };
+    let fill_abs = check_inventory_limit(eff, fill_abs, is_buy)?;
+    if fill_abs == 0 {
+        return Ok(zero);
+    }
+    let q = v2::AdaptiveQuoteIn {
+        oracle_e6: call.oracle_price_e6,
+        fill: fill_abs,
+        taker_buys: is_buy,
+        inv_pre: eff.inventory_base,
+        base_spread_bps: eff.base_spread_bps,
+        max_total_bps: eff.max_total_bps,
+        fee_bps,
+        impact_k_bps: eff.impact_k_bps,
+        depth_e6: eff.liquidity_notional_e6,
+        s_mult_bps: eff.skew_spread_mult_bps,
+        r_mult_bps: cfg.thin_rebate_mult_bps,
+        skew_cap_bps: cfg.skew_cap_bps,
+        rebate_cap_bps: cfg.rebate_cap_bps,
+        ref_inv: cfg.skew_ref_inventory,
+    };
+    let (fill, price, _total) = v2::quote_adaptive(&q).ok_or(ProgramError::ArithmeticOverflow)?;
+    if fill == 0 {
+        return Ok(zero);
+    }
+    // fill <= fill_abs <= max_fill_abs <= i128::MAX (validate), so the cast is lossless.
+    let exec_size = if is_buy {
+        fill as i128
+    } else {
+        -(fill as i128)
+    };
+    Ok(LegOut {
+        exec_price_e6: price,
+        exec_size,
+        flags: execution_flags(fill, req_abs),
+        fee_bps: fee_bps as u32,
+    })
 }
 
 /// Process a batched matcher call (tag 3): fill N legs against this LP's single inventory in one
@@ -591,16 +995,32 @@ pub fn process_batch_call(
     ctx_account: &AccountInfo,
     instruction_data: &[u8],
 ) -> ProgramResult {
+    process_batch_call_with_clock(lp_pda, ctx_account, instruction_data, clock_slot)
+}
+
+/// `process_batch_call` with an injectable slot source (see `process_call_with_clock`).
+pub fn process_batch_call_with_clock(
+    lp_pda: &AccountInfo,
+    ctx_account: &AccountInfo,
+    instruction_data: &[u8],
+    slot_source: fn() -> Result<u64, ProgramError>,
+) -> ProgramResult {
     if instruction_data.len() < MATCHER_BATCH_HEADER_LEN {
         return Err(ProgramError::InvalidInstructionData);
     }
     let n = instruction_data[1] as usize;
-    if n == 0
-        || n > MATCHER_BATCH_MAX_LEGS
-        || instruction_data.len() != MATCHER_BATCH_HEADER_LEN + n * MATCHER_BATCH_LEG_LEN
-    {
+    if n == 0 || n > MATCHER_BATCH_MAX_LEGS {
         return Err(ProgramError::InvalidInstructionData);
     }
+    // P2: legacy length (legs only) or legs + one 24-byte call extension per leg.
+    let legs_end = MATCHER_BATCH_HEADER_LEN + n * MATCHER_BATCH_LEG_LEN;
+    let has_ext = if instruction_data.len() == legs_end {
+        false
+    } else if instruction_data.len() == legs_end + n * v2::CALL_EXT_LEN {
+        true
+    } else {
+        return Err(ProgramError::InvalidInstructionData);
+    };
     let req_id = u64::from_le_bytes(instruction_data[2..10].try_into().unwrap());
     let lp_account_id = u64::from_le_bytes(instruction_data[10..18].try_into().unwrap());
 
@@ -681,6 +1101,16 @@ pub fn process_batch_call(
         }
     }
 
+    let now = if ctx.v2_block().is_some() {
+        Some(slot_source()?)
+    } else {
+        None
+    };
+    // Headroom is pre-batch state: legs on the same (asset, direction) consume it jointly.
+    let mut used: [(u16, bool, u128); MATCHER_BATCH_MAX_LEGS] =
+        [(0, false, 0); MATCHER_BATCH_MAX_LEGS];
+    let mut used_count = 0usize;
+
     let mut returns = [0u8; MATCHER_BATCH_MAX_LEGS * MATCHER_RETURN_LEN];
     for i in 0..n {
         // #13: Reset per-leg insurance remainder. Each leg is an independent fill;
@@ -701,6 +1131,12 @@ pub fn process_batch_call(
         if req_size == i128::MIN {
             return Err(ProgramError::InvalidInstructionData);
         }
+        let ext = if has_ext {
+            let eb = legs_end + i * v2::CALL_EXT_LEN;
+            CallExt::parse(&instruction_data[eb..eb + v2::CALL_EXT_LEN])?
+        } else {
+            CallExt::default()
+        };
         let call = MatcherCall {
             req_id,
             asset_index,
@@ -708,37 +1144,37 @@ pub fn process_batch_call(
             oracle_price_e6,
             req_size,
         };
-        let (exec_price, exec_size, flags) = compute_execution(&ctx, &call)?;
-        if exec_size != 0 {
-            // Use checked_sub (not saturating_sub) so any overflow aborts the batch
-            // atomically before the ctx write below — no partial-fill state escapes.
-            ctx.inventory_base = ctx
-                .inventory_base
-                .checked_sub(exec_size)
-                .ok_or(ProgramError::ArithmeticOverflow)?;
-            ctx.last_oracle_price_e6 = oracle_price_e6;
-            ctx.last_exec_price_e6 = exec_price;
-
-            // Accrue insurance fee per-leg, same as single-fill path.
-            if ctx.fee_to_insurance_bps > 0 {
-                let (insurance_fee, remainder) = compute_insurance_fee(&ctx, exec_size, exec_price);
-                ctx.insurance_accrued_e6 = ctx
-                    .insurance_accrued_e6
-                    .checked_add(insurance_fee)
-                    .ok_or(ProgramError::ArithmeticOverflow)?;
-                ctx.insurance_fee_remainder_e6 = remainder;
+        let dir = req_size > 0;
+        let slot = used[..used_count]
+            .iter()
+            .position(|&(a, d, _)| a == asset_index && d == dir);
+        let already = slot.map(|k| used[k].2).unwrap_or(0);
+        let out = execute_leg(&mut ctx, &call, &ext, now, already)?;
+        // Use checked_sub (not saturating_sub) so any overflow aborts the batch
+        // atomically before the ctx write below — no partial-fill state escapes.
+        apply_fill(&mut ctx, &out, oracle_price_e6)?;
+        let filled = out.exec_size.unsigned_abs();
+        match slot {
+            Some(k) => used[k].2 = used[k].2.saturating_add(filled),
+            None => {
+                used[used_count] = (asset_index, dir, filled);
+                used_count += 1;
             }
         }
         let ret = MatcherReturn {
             abi_version: MATCHER_ABI_VERSION,
-            flags,
-            exec_price_e6: exec_price,
-            exec_size,
+            flags: out.flags,
+            exec_price_e6: out.exec_price_e6,
+            exec_size: out.exec_size,
             req_id,
             lp_account_id,
             oracle_price_e6,
             asset_index: asset_index as u64,
-        };
+        }
+        // sync/v16-migration-backing-fee-cap: same cap on every leg of the batch —
+        // it's a per-context (per-LP) config, not per-leg.
+        .with_backing_fee_cap_bps(ctx.backing_fee_cap_bps);
+        let ret = with_fee_request(ret, &ext, oracle_price_e6);
         ret.write_to(&mut returns[i * MATCHER_RETURN_LEN..])?;
     }
 
@@ -761,6 +1197,8 @@ fn compute_execution(
     match ctx.get_kind()? {
         MatcherKind::Passive => compute_passive_execution(ctx, call),
         MatcherKind::Vamm => compute_vamm_execution(ctx, call),
+        // Kind 2 is priced only through `execute_leg` (needs the v2 block + clock).
+        MatcherKind::Adaptive => Err(ProgramError::InvalidAccountData),
     }
 }
 
@@ -1051,6 +1489,306 @@ fn check_inventory_limit(
     }
 }
 
+// =============================================================================
+// Configure (Tag 5) — P2. Post-init configuration WITHOUT a wrapper change.
+// =============================================================================
+//
+// Why this exists: every existing config path (tag 2 init, tag 4 backing-fee cap) must be
+// signed by `lp_pda`, which on a real market is the wrapper's matcher-delegate PDA. Only
+// the wrapper can sign for it, and the wrapper only ever signs tag 0 / tag 3 calls and the
+// fixed 78-byte tag-2 init (wrapper tag 83). So tag 4 was unreachable and every context's
+// config was frozen at init (backing_fee_cap_bps stuck at 0 — the P2 side ticket).
+//
+// Tag 5 accepts either:
+//   auth_mode 0: `lp_pda` signs (direct / test contexts, or a future wrapper passthrough);
+//   auth_mode 1: owner proof — the LP OWNER signs and supplies the delegate seeds; the
+//                matcher recomputes
+//                  create_program_address(["matcher", market, lp_portfolio, lp_owner,
+//                                          this_program_id, ctx_key, [bump]], wrapper_id)
+//                and requires it to equal ctx.lp_pda. A PDA is a hash of its seeds, so a
+//                signer that is not the lp_owner the delegate was derived for cannot
+//                reproduce it. TradeCpi derives the delegate from the portfolio's CURRENT
+//                owner, so after an ownership transfer the old ctx no longer fills and the
+//                old owner's authority over it is moot.
+//
+// Wire:
+//   [0] tag = 5
+//   [1] auth_mode (0 | 1)
+//   auth_mode 1 only: [2..34] wrapper_program_id, [34..66] market, [66..98] lp_portfolio,
+//                     [98] bump                                    (header = 99 bytes)
+//   auth_mode 0:                                                   (header = 2 bytes)
+//   [h]   op: 0 = SetBackingFeeCap, 1 = SetParams
+//   op 0: [h+1..h+3] backing_fee_cap_bps u16                        (total h + 3)
+//   op 1: [h+1..h+1+SET_PARAMS_LEN] SetParams (below)               (total h + 1 + 105)
+//
+// Accounts: 0 [signer] authority (lp_pda or lp_owner), 1 [writable] ctx_account.
+
+pub const MATCHER_CONFIGURE_TAG: u8 = 5;
+pub const CONFIGURE_AUTH_LP_PDA: u8 = 0;
+pub const CONFIGURE_AUTH_OWNER_PROOF: u8 = 1;
+pub const CONFIGURE_OP_BACKING_FEE_CAP: u8 = 0;
+pub const CONFIGURE_OP_SET_PARAMS: u8 = 1;
+pub const CONFIGURE_HEADER_LP_PDA_LEN: usize = 2;
+pub const CONFIGURE_HEADER_OWNER_PROOF_LEN: usize = 99;
+/// SetParams payload length (see `SetParams::parse`).
+pub const SET_PARAMS_LEN: usize = 105;
+
+/// Full parameter set for op 1. Core fields replace the context's; v2 config replaces the
+/// v2 block's config and restarts the volatility estimator (cold fee until warm). State
+/// that is not configuration — inventory, insurance accrual, lp_pda, lp_account_id,
+/// backing_fee_cap, asset binding, observed-mark tracker — is preserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetParams {
+    pub kind: u8,
+    pub trading_fee_bps: u32,
+    pub base_spread_bps: u32,
+    pub max_total_bps: u32,
+    pub impact_k_bps: u32,
+    pub liquidity_notional_e6: u128,
+    pub max_fill_abs: u128,
+    pub max_inventory_abs: u128,
+    pub fee_to_insurance_bps: u16,
+    pub skew_spread_mult_bps: u16,
+    /// `enable_v2 == false` clears the v2 block (only legal for kinds 0/1): back to the
+    /// exact v1 behaviour.
+    pub enable_v2: bool,
+    pub v2: V2Config,
+}
+
+impl SetParams {
+    pub fn parse(d: &[u8]) -> Result<Self, ProgramError> {
+        if d.len() != SET_PARAMS_LEN {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let u16_at = |o: usize| u16::from_le_bytes([d[o], d[o + 1]]);
+        let u32_at = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+        let u128_at = |o: usize| u128::from_le_bytes(d[o..o + 16].try_into().unwrap());
+        let enable = match d[69] {
+            0 => false,
+            1 => true,
+            _ => return Err(ProgramError::InvalidInstructionData),
+        };
+        Ok(Self {
+            kind: d[0],
+            trading_fee_bps: u32_at(1),
+            base_spread_bps: u32_at(5),
+            max_total_bps: u32_at(9),
+            impact_k_bps: u32_at(13),
+            liquidity_notional_e6: u128_at(17),
+            max_fill_abs: u128_at(33),
+            max_inventory_abs: u128_at(49),
+            fee_to_insurance_bps: u16_at(65),
+            skew_spread_mult_bps: u16_at(67),
+            enable_v2: enable,
+            v2: V2Config {
+                flags: d[70],
+                fee_lo_bps: u16_at(71),
+                fee_hi_bps: u16_at(73),
+                fee_cold_bps: u16_at(75),
+                vol_a_milli: u16_at(77),
+                vol_b_den: u16_at(79),
+                vol_alpha_bps: u16_at(81),
+                vol_warmup: d[83],
+                vol_move_cap_10bps: d[84],
+                vol_ref_slots: u16_at(85),
+                thin_rebate_mult_bps: u16_at(87),
+                skew_cap_bps: u16_at(89),
+                rebate_cap_bps: u16_at(91),
+                max_mark_age_slots: u16_at(93),
+                observed_stale_slots: u16_at(95),
+                skew_ref_inventory: u64::from_le_bytes(d[97..105].try_into().unwrap()),
+            },
+        })
+    }
+}
+
+impl SetParams {
+    pub fn encode(&self) -> [u8; SET_PARAMS_LEN] {
+        let mut d = [0u8; SET_PARAMS_LEN];
+        let c = &self.v2;
+        d[0] = self.kind;
+        d[1..5].copy_from_slice(&self.trading_fee_bps.to_le_bytes());
+        d[5..9].copy_from_slice(&self.base_spread_bps.to_le_bytes());
+        d[9..13].copy_from_slice(&self.max_total_bps.to_le_bytes());
+        d[13..17].copy_from_slice(&self.impact_k_bps.to_le_bytes());
+        d[17..33].copy_from_slice(&self.liquidity_notional_e6.to_le_bytes());
+        d[33..49].copy_from_slice(&self.max_fill_abs.to_le_bytes());
+        d[49..65].copy_from_slice(&self.max_inventory_abs.to_le_bytes());
+        d[65..67].copy_from_slice(&self.fee_to_insurance_bps.to_le_bytes());
+        d[67..69].copy_from_slice(&self.skew_spread_mult_bps.to_le_bytes());
+        d[69] = self.enable_v2 as u8;
+        d[70] = c.flags;
+        d[71..73].copy_from_slice(&c.fee_lo_bps.to_le_bytes());
+        d[73..75].copy_from_slice(&c.fee_hi_bps.to_le_bytes());
+        d[75..77].copy_from_slice(&c.fee_cold_bps.to_le_bytes());
+        d[77..79].copy_from_slice(&c.vol_a_milli.to_le_bytes());
+        d[79..81].copy_from_slice(&c.vol_b_den.to_le_bytes());
+        d[81..83].copy_from_slice(&c.vol_alpha_bps.to_le_bytes());
+        d[83] = c.vol_warmup;
+        d[84] = c.vol_move_cap_10bps;
+        d[85..87].copy_from_slice(&c.vol_ref_slots.to_le_bytes());
+        d[87..89].copy_from_slice(&c.thin_rebate_mult_bps.to_le_bytes());
+        d[89..91].copy_from_slice(&c.skew_cap_bps.to_le_bytes());
+        d[91..93].copy_from_slice(&c.rebate_cap_bps.to_le_bytes());
+        d[93..95].copy_from_slice(&c.max_mark_age_slots.to_le_bytes());
+        d[95..97].copy_from_slice(&c.observed_stale_slots.to_le_bytes());
+        d[97..105].copy_from_slice(&c.skew_ref_inventory.to_le_bytes());
+        d
+    }
+}
+
+/// Owner-proof seeds for auth mode 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnerProof {
+    pub wrapper_program_id: [u8; 32],
+    pub market: [u8; 32],
+    pub lp_portfolio: [u8; 32],
+    pub bump: u8,
+}
+
+/// Build tag-5 instruction data.
+pub fn encode_configure(proof: Option<&OwnerProof>, op_payload: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::with_capacity(CONFIGURE_HEADER_OWNER_PROOF_LEN + op_payload.len());
+    v.push(MATCHER_CONFIGURE_TAG);
+    match proof {
+        None => v.push(CONFIGURE_AUTH_LP_PDA),
+        Some(p) => {
+            v.push(CONFIGURE_AUTH_OWNER_PROOF);
+            v.extend_from_slice(&p.wrapper_program_id);
+            v.extend_from_slice(&p.market);
+            v.extend_from_slice(&p.lp_portfolio);
+            v.push(p.bump);
+        }
+    }
+    v.extend_from_slice(op_payload);
+    v
+}
+
+/// Process Configure (Tag 5). See the block comment above for wire + auth.
+pub fn process_configure(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    let account_iter = &mut accounts.iter();
+    let authority = next_account_info(account_iter)?;
+    let ctx_account = next_account_info(account_iter)?;
+
+    if ctx_account.owner != program_id {
+        return Err(ProgramError::IncorrectProgramId);
+    }
+    if ctx_account.data_len() < MATCHER_CONTEXT_LEN {
+        return Err(ProgramError::AccountDataTooSmall);
+    }
+    if !ctx_account.is_writable {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // PM-3: signer check before any account-data inspection.
+    if !authority.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+    if instruction_data.len() < CONFIGURE_HEADER_LP_PDA_LEN
+        || instruction_data[0] != MATCHER_CONFIGURE_TAG
+    {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let auth_mode = instruction_data[1];
+    let header_len = match auth_mode {
+        CONFIGURE_AUTH_LP_PDA => CONFIGURE_HEADER_LP_PDA_LEN,
+        CONFIGURE_AUTH_OWNER_PROOF => CONFIGURE_HEADER_OWNER_PROOF_LEN,
+        _ => return Err(ProgramError::InvalidInstructionData),
+    };
+    if instruction_data.len() < header_len + 1 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    let mut ctx = {
+        let data = ctx_account.try_borrow_data()?;
+        MatcherCtx::read_from(&data[CTX_VAMM_OFFSET..])?
+    };
+    ctx.validate()?;
+
+    match auth_mode {
+        CONFIGURE_AUTH_LP_PDA => {
+            if authority.key.to_bytes() != ctx.lp_pda {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+        _ => {
+            let d = instruction_data;
+            let wrapper = Pubkey::new_from_array(d[2..34].try_into().unwrap());
+            let market: &[u8] = &d[34..66];
+            let portfolio: &[u8] = &d[66..98];
+            let bump = [d[98]];
+            let derived = Pubkey::create_program_address(
+                &[
+                    b"matcher",
+                    market,
+                    portfolio,
+                    authority.key.as_ref(),
+                    program_id.as_ref(),
+                    ctx_account.key.as_ref(),
+                    &bump,
+                ],
+                &wrapper,
+            )
+            .map_err(|_| ProgramError::Custom(v2::ERR_OWNER_PROOF_MISMATCH))?;
+            if derived.to_bytes() != ctx.lp_pda {
+                return Err(ProgramError::Custom(v2::ERR_OWNER_PROOF_MISMATCH));
+            }
+        }
+    }
+
+    let op = instruction_data[header_len];
+    let payload = &instruction_data[header_len + 1..];
+    match op {
+        CONFIGURE_OP_BACKING_FEE_CAP => {
+            if payload.len() != 2 {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            let cap = u16::from_le_bytes([payload[0], payload[1]]);
+            if cap > BACKING_FEE_CAP_BPS_MAX {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            ctx.backing_fee_cap_bps = cap;
+        }
+        CONFIGURE_OP_SET_PARAMS => {
+            let p = SetParams::parse(payload)?;
+            let _ = MatcherKind::try_from(p.kind)?;
+            let prev = ctx.v2_block();
+            ctx.kind = p.kind;
+            ctx.trading_fee_bps = p.trading_fee_bps;
+            ctx.base_spread_bps = p.base_spread_bps;
+            ctx.max_total_bps = p.max_total_bps;
+            ctx.impact_k_bps = p.impact_k_bps;
+            ctx.liquidity_notional_e6 = p.liquidity_notional_e6;
+            // Same "unbounded" clamp as process_init (M-NEW-3 / M-HIGH-2).
+            ctx.max_fill_abs = core::cmp::min(p.max_fill_abs, i128::MAX as u128);
+            ctx.max_inventory_abs = core::cmp::min(p.max_inventory_abs, i128::MAX as u128);
+            ctx.fee_to_insurance_bps = p.fee_to_insurance_bps;
+            ctx.skew_spread_mult_bps = p.skew_spread_mult_bps;
+            if p.enable_v2 {
+                let mut b = V2Block::fresh(p.v2);
+                if let Some(old) = prev {
+                    // Preserve non-config state: binding + observed-mark tracker.
+                    b.st.bound_asset_plus1 = old.st.bound_asset_plus1;
+                    b.st.obs_price_e6 = old.st.obs_price_e6;
+                    b.st.obs_since_slot = old.st.obs_since_slot;
+                }
+                ctx.set_v2_block(&b);
+            } else {
+                ctx._reserved = [0; 78];
+            }
+        }
+        _ => return Err(ProgramError::InvalidInstructionData),
+    }
+    ctx.validate()?;
+
+    let mut data = ctx_account.try_borrow_mut_data()?;
+    ctx.write_to(&mut data[CTX_VAMM_OFFSET..])?;
+    Ok(())
+}
+
 // Legacy re-exports
 pub use process_call as process_vamm_call;
 pub use process_init as process_init_vamm;
@@ -1093,7 +1831,8 @@ mod tests {
             _new_pad: [0; 4],
             lp_account_id: 100,
             insurance_fee_remainder_e6: 0,
-            _reserved: [0; 80],
+            backing_fee_cap_bps: 0,
+            _reserved: [0; 78],
         }
     }
 
@@ -1120,7 +1859,8 @@ mod tests {
             _new_pad: [0; 4],
             lp_account_id: 100,
             insurance_fee_remainder_e6: 0,
-            _reserved: [0; 80],
+            backing_fee_cap_bps: 0,
+            _reserved: [0; 78],
         }
     }
 
@@ -2469,18 +3209,64 @@ mod tests {
     }
 
     /// #15: _reserved must start at offset 176 (not 168 as the old fixture claimed).
+    ///
+    /// sync/v16-migration-backing-fee-cap: offset 176 is no longer the start of
+    /// `_reserved` — the first 2 bytes (176..178) are now `backing_fee_cap_bps`, and
+    /// `_reserved` shrank from 80 to 78 bytes (178..256). This test still holds
+    /// because a freshly-written default ctx has `backing_fee_cap_bps == 0`, so the
+    /// whole 176..256 span is zero either way; `test_backing_fee_cap_bps_field_offset`
+    /// below is the one that actually distinguishes the two sub-fields.
     #[test]
     fn test_sdk_fixture_reserved_starts_at_offset_176() {
         let ctx = default_vamm_ctx();
         let mut buf = [0u8; CTX_VAMM_LEN];
         ctx.write_to(&mut buf).unwrap();
-        // _reserved is 80 bytes; we verify the range 176..256 is zeros for a
-        // freshly-written default ctx.
         assert_eq!(
             &buf[176..256],
             &[0u8; 80],
-            "_reserved[0..80] must occupy MatcherCtx offset 176..256"
+            "MatcherCtx offset 176..256 (backing_fee_cap_bps + _reserved) must be zero for a default ctx"
         );
+    }
+
+    /// sync/v16-migration-backing-fee-cap: `backing_fee_cap_bps` serializes at
+    /// MatcherCtx offset 176..178 (u16 LE), and `_reserved` now occupies 178..256
+    /// (78 bytes, was 80 at 176..256 before this field was carved out).
+    #[test]
+    fn test_backing_fee_cap_bps_field_offset() {
+        let mut ctx = default_vamm_ctx();
+        ctx.backing_fee_cap_bps = 0x1234;
+        // Sentinel-fill the trailing reserved bytes so a shift in either direction
+        // (backing_fee_cap_bps leaking into _reserved, or vice versa) is caught.
+        ctx._reserved = [0xEE; 78];
+
+        let mut buf = [0u8; CTX_VAMM_LEN];
+        ctx.write_to(&mut buf).unwrap();
+
+        assert_eq!(
+            u16::from_le_bytes(buf[176..178].try_into().unwrap()),
+            0x1234,
+            "backing_fee_cap_bps must serialize at MatcherCtx offset 176..178"
+        );
+        assert_eq!(
+            &buf[178..256],
+            &[0xEEu8; 78],
+            "_reserved must serialize at MatcherCtx offset 178..256 (78 bytes)"
+        );
+
+        // Round-trip through read_from.
+        let decoded = MatcherCtx::read_from(&buf).unwrap();
+        assert_eq!(decoded.backing_fee_cap_bps, 0x1234);
+        assert_eq!(decoded._reserved, [0xEEu8; 78]);
+    }
+
+    /// The account-level offset (CTX_VAMM_OFFSET + 176 = 240) is what a client
+    /// reading the raw 320-byte context account — not just the 256-byte MatcherCtx
+    /// slice — must seek to. Pin it so `CTX_BACKING_FEE_CAP_OFFSET` can't drift from
+    /// `CTX_VAMM_OFFSET` + the field's in-struct offset.
+    #[test]
+    fn test_ctx_backing_fee_cap_offset_is_240() {
+        assert_eq!(crate::CTX_BACKING_FEE_CAP_OFFSET, 240);
+        assert_eq!(crate::CTX_BACKING_FEE_CAP_OFFSET, CTX_VAMM_OFFSET + 176);
     }
 
     /// #16: MATCHER_BATCH_CALL_TAG is 3 — pin the value so any accidental
@@ -2492,6 +3278,306 @@ mod tests {
             MATCHER_BATCH_CALL_TAG, 3u8,
             "#16: MATCHER_BATCH_CALL_TAG must be 3"
         );
+    }
+
+    // ==========================================================================
+    // sync/v16-migration-backing-fee-cap
+    // ==========================================================================
+
+    /// Batch leg: the configured cap must be encoded in every leg's flags, same as
+    /// the single-fill path (`process_batch_call`'s per-leg construction is
+    /// mirrored here rather than invoked directly, because it ends in
+    /// `set_return_data`, a real syscall unavailable outside a BPF/validator
+    /// runtime — see the other `process_batch_call requires a Solana AccountInfo
+    /// runtime` notes in this file).
+    #[test]
+    fn test_batch_return_carries_configured_backing_fee_cap() {
+        let mut ctx = default_passive_ctx();
+        ctx.backing_fee_cap_bps = 317;
+        let call = MatcherCall {
+            req_id: 42,
+            asset_index: 7,
+            lp_account_id: 0xDEAD_CAFE,
+            oracle_price_e6: 100_000_000,
+            req_size: 100,
+        };
+        let (exec_price, exec_size, flags) = compute_execution(&ctx, &call).unwrap();
+        // Construct MatcherReturn exactly as process_batch_call does, including the
+        // trailing `.with_backing_fee_cap_bps(ctx.backing_fee_cap_bps)`.
+        let ret = MatcherReturn {
+            abi_version: crate::MATCHER_ABI_VERSION,
+            flags,
+            exec_price_e6: exec_price,
+            exec_size,
+            req_id: call.req_id,
+            lp_account_id: call.lp_account_id,
+            oracle_price_e6: call.oracle_price_e6,
+            asset_index: call.asset_index as u64,
+        }
+        .with_backing_fee_cap_bps(ctx.backing_fee_cap_bps);
+
+        assert_eq!(ret.backing_fee_cap_bps(), 317);
+        // Raw bit check against the exact wrapper shift/mask (FLAG_BACKING_FEE_CAP_SHIFT=8,
+        // FLAG_BACKING_FEE_CAP_MASK=0x3fff<<8), so a wrong shift/mask in the builder
+        // would be caught even if backing_fee_cap_bps() used the same (wrong) constants.
+        assert_eq!(ret.flags, FLAG_VALID | (317u32 << 8));
+    }
+
+    // ── ConfigureBackingFeeCap (tag 4) instruction tests ──────────────────────
+
+    fn init_ctx_data(
+        program_id: &Pubkey,
+        lp_key: &Pubkey,
+        lp_account_id: u64,
+    ) -> [u8; MATCHER_CONTEXT_LEN] {
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let mut ctx_data = [0u8; MATCHER_CONTEXT_LEN];
+        let ctx_key = Pubkey::new_unique();
+        let accounts = make_init_account_infos(
+            lp_key,
+            true,
+            &mut lp_lamports,
+            &ctx_key,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            program_id,
+        );
+        let mut params = default_init_params();
+        params.lp_account_id = lp_account_id;
+        process_init(program_id, &accounts, &params.encode()).unwrap();
+        ctx_data
+    }
+
+    #[test]
+    fn test_configure_backing_fee_cap_requires_signer() {
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique();
+        let mut ctx_data = init_ctx_data(&program_id, &lp_key, 42);
+        let ctx_key = Pubkey::new_unique();
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let accounts = make_init_account_infos(
+            &lp_key,
+            false, // NOT signing
+            &mut lp_lamports,
+            &ctx_key,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+        );
+        let params = ConfigureBackingFeeCapParams {
+            backing_fee_cap_bps: 250,
+        };
+        let result = process_configure_backing_fee_cap(&program_id, &accounts, &params.encode());
+        assert_eq!(result, Err(ProgramError::MissingRequiredSignature));
+    }
+
+    #[test]
+    fn test_configure_backing_fee_cap_rejects_wrong_lp() {
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique();
+        let mut ctx_data = init_ctx_data(&program_id, &lp_key, 42);
+        let ctx_key = Pubkey::new_unique();
+        let other_lp_key = Pubkey::new_unique(); // signs, but isn't ctx.lp_pda
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let accounts = make_init_account_infos(
+            &other_lp_key,
+            true,
+            &mut lp_lamports,
+            &ctx_key,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+        );
+        let params = ConfigureBackingFeeCapParams {
+            backing_fee_cap_bps: 250,
+        };
+        let result = process_configure_backing_fee_cap(&program_id, &accounts, &params.encode());
+        assert_eq!(result, Err(ProgramError::InvalidAccountData));
+    }
+
+    #[test]
+    fn test_configure_backing_fee_cap_rejects_over_10000_bps() {
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique();
+        let mut ctx_data = init_ctx_data(&program_id, &lp_key, 42);
+        let ctx_key = Pubkey::new_unique();
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let accounts = make_init_account_infos(
+            &lp_key,
+            true,
+            &mut lp_lamports,
+            &ctx_key,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+        );
+        let params = ConfigureBackingFeeCapParams {
+            backing_fee_cap_bps: 10_001, // > BACKING_FEE_CAP_BPS_MAX
+        };
+        let result = process_configure_backing_fee_cap(&program_id, &accounts, &params.encode());
+        assert_eq!(result, Err(ProgramError::InvalidInstructionData));
+        // Nothing must have been written on a rejected config.
+        let ctx = MatcherCtx::read_from(&ctx_data[CTX_VAMM_OFFSET..]).unwrap();
+        assert_eq!(ctx.backing_fee_cap_bps, 0);
+    }
+
+    #[test]
+    fn test_configure_backing_fee_cap_rejects_uninitialized_ctx() {
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique();
+        let ctx_key = Pubkey::new_unique();
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let mut ctx_data = [0u8; MATCHER_CONTEXT_LEN]; // never process_init'd
+        let accounts = make_init_account_infos(
+            &lp_key,
+            true,
+            &mut lp_lamports,
+            &ctx_key,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+        );
+        let params = ConfigureBackingFeeCapParams {
+            backing_fee_cap_bps: 250,
+        };
+        let result = process_configure_backing_fee_cap(&program_id, &accounts, &params.encode());
+        assert_eq!(result, Err(ProgramError::UninitializedAccount));
+    }
+
+    /// Positive control + the round-trip the wrapper actually relies on:
+    /// process_configure_backing_fee_cap → process_init state persists → the next
+    /// process_call's MatcherReturn carries the configured cap in flags bits 8..21.
+    #[test]
+    fn test_configure_then_call_emits_cap_in_return() {
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique();
+        let lp_account_id = 42u64;
+        let mut ctx_data = init_ctx_data(&program_id, &lp_key, lp_account_id);
+        let ctx_key = Pubkey::new_unique();
+
+        // 1) Configure a nonzero cap.
+        {
+            let mut lp_lamports = 0u64;
+            let mut ctx_lamports = 0u64;
+            let accounts = make_init_account_infos(
+                &lp_key,
+                true,
+                &mut lp_lamports,
+                &ctx_key,
+                &mut ctx_lamports,
+                &mut ctx_data,
+                &program_id,
+            );
+            let params = ConfigureBackingFeeCapParams {
+                backing_fee_cap_bps: 987,
+            };
+            process_configure_backing_fee_cap(&program_id, &accounts, &params.encode()).unwrap();
+        }
+        {
+            let ctx = MatcherCtx::read_from(&ctx_data[CTX_VAMM_OFFSET..]).unwrap();
+            assert_eq!(ctx.backing_fee_cap_bps, 987);
+        }
+
+        // 2) Drive a single-fill call through the *real* process_call entry point
+        // and read the MatcherReturn it writes into the context account's own
+        // return slot (offset 0..64) — no shortcuts through compute_execution.
+        {
+            let mut lp_lamports = 0u64;
+            let mut ctx_lamports = 0u64;
+            let lp_info = AccountInfo::new(
+                &lp_key,
+                true,
+                false,
+                &mut lp_lamports,
+                &mut [],
+                &program_id,
+                false,
+                0,
+            );
+            let ctx_info = AccountInfo::new(
+                &ctx_key,
+                false,
+                true,
+                &mut ctx_lamports,
+                &mut ctx_data[..],
+                &program_id,
+                false,
+                0,
+            );
+            let mut call_data = [0u8; crate::MATCHER_CALL_LEN];
+            call_data[0] = crate::MATCHER_CALL_TAG;
+            call_data[1..9].copy_from_slice(&11u64.to_le_bytes()); // req_id
+            call_data[9..11].copy_from_slice(&3u16.to_le_bytes()); // asset_index
+            call_data[11..19].copy_from_slice(&lp_account_id.to_le_bytes());
+            call_data[19..27].copy_from_slice(&100_000_000u64.to_le_bytes()); // oracle_price_e6
+            call_data[27..43].copy_from_slice(&1000i128.to_le_bytes()); // req_size
+            process_call(&lp_info, &ctx_info, &call_data).unwrap();
+        }
+
+        // 3) The MatcherReturn is written at CTX_RETURN_OFFSET (0) in the same
+        // account buffer we just passed as ctx_account — decode it straight out of
+        // ctx_data, exactly as the wrapper's `read_matcher_return` would read the
+        // account's return slot.
+        let flags = u32::from_le_bytes(ctx_data[4..8].try_into().unwrap());
+        let cap = ((flags & FLAG_BACKING_FEE_CAP_MASK_FOR_TEST) >> 8) as u16;
+        assert_eq!(cap, 987, "returned flags must carry the configured cap");
+        assert_eq!(
+            flags & FLAG_VALID,
+            FLAG_VALID,
+            "FLAG_VALID must still be set"
+        );
+
+        // Decode via the crate's own accessor too — must agree.
+        let ret = MatcherReturn {
+            abi_version: u32::from_le_bytes(ctx_data[0..4].try_into().unwrap()),
+            flags,
+            exec_price_e6: u64::from_le_bytes(ctx_data[8..16].try_into().unwrap()),
+            exec_size: i128::from_le_bytes(ctx_data[16..32].try_into().unwrap()),
+            req_id: u64::from_le_bytes(ctx_data[32..40].try_into().unwrap()),
+            lp_account_id: u64::from_le_bytes(ctx_data[40..48].try_into().unwrap()),
+            oracle_price_e6: u64::from_le_bytes(ctx_data[48..56].try_into().unwrap()),
+            asset_index: u64::from_le_bytes(ctx_data[56..64].try_into().unwrap()),
+        };
+        assert_eq!(ret.backing_fee_cap_bps(), 987);
+    }
+
+    /// Local re-derivation of the mask, kept separate from `FLAG_BACKING_FEE_CAP_MASK`
+    /// on purpose: this test decodes the raw wire bytes by hand (not via the crate's
+    /// own accessor) so it fails if the *constant itself* — not just some caller of
+    /// it — drifted from the wrapper's `FLAG_BACKING_FEE_CAP_MASK = 0x3fff << 8`.
+    const FLAG_BACKING_FEE_CAP_MASK_FOR_TEST: u32 = 0x3fff << 8;
+
+    /// The full instruction router (tag 4) must dispatch to
+    /// process_configure_backing_fee_cap, not just the vamm module fn directly.
+    #[test]
+    fn test_process_instruction_dispatches_tag_4() {
+        let program_id = Pubkey::new_unique();
+        let lp_key = Pubkey::new_unique();
+        let mut ctx_data = init_ctx_data(&program_id, &lp_key, 42);
+        let ctx_key = Pubkey::new_unique();
+        let mut lp_lamports = 0u64;
+        let mut ctx_lamports = 0u64;
+        let accounts = make_init_account_infos(
+            &lp_key,
+            true,
+            &mut lp_lamports,
+            &ctx_key,
+            &mut ctx_lamports,
+            &mut ctx_data,
+            &program_id,
+        );
+        let params = ConfigureBackingFeeCapParams {
+            backing_fee_cap_bps: 42,
+        };
+        crate::process_instruction(&program_id, &accounts, &params.encode()).unwrap();
+        drop(accounts);
+        let ctx = MatcherCtx::read_from(&ctx_data[CTX_VAMM_OFFSET..]).unwrap();
+        assert_eq!(ctx.backing_fee_cap_bps, 42);
     }
 }
 
@@ -2574,7 +3660,8 @@ mod proofs {
             _new_pad: [0; 4],
             lp_account_id: 0,
             insurance_fee_remainder_e6: 0,
-            _reserved: [0; 80],
+            backing_fee_cap_bps: 0,
+            _reserved: [0; 78],
         };
 
         let fill_abs = check_inventory_limit(&ctx, fill_req, is_buy).unwrap();
@@ -2914,7 +4001,8 @@ mod proofs {
             _new_pad: [0; 4],
             lp_account_id: 1,
             insurance_fee_remainder_e6: 0,
-            _reserved: [0; 80],
+            backing_fee_cap_bps: 0,
+            _reserved: [0; 78],
         };
         assert!(
             ctx_inv.validate().is_err(),
