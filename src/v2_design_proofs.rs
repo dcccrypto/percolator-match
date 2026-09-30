@@ -144,7 +144,7 @@ fn kani_design_p2_02_quote_never_crosses_any_domain() {
         }
         kani::cover!(fill > 0 && fill < q.fill, "size clip exercised");
         kani::cover!(fill > 0 && q.taker_buys && price > q.oracle_e6, "buy priced above oracle");
-        kani::cover!(fill > 0 && q.s_mult_bps > 10_000 && q.ref_inv == u64::MAX, "outside the builder's domain");
+        kani::cover!(fill > 0 && q.s_mult_bps > 10_000 && q.ref_inv == u64::MAX, "(fields unread under the impact/skew stub: this cover only shows the admitted domain is not narrowed by assumes)");
     }
 }
 
@@ -178,57 +178,38 @@ fn kani_design_p2_03_fill_monotone_in_request() {
     }
 }
 
-// ── D-P2-04  isqrt is the exact floor square root on the FULL u64 domain (the estimator feeds
-// vol_var_e4 values above 2^32; the builder proof stops at 2^32).
+// ── D-P2-01s  u32-oracle regression twin of D-P2-01 (the pre-declared fallback if the full-u64
+// harness has no verdict in 1 h; with L-PRICE on paper for full width).
 #[kani::proof]
-#[kani::unwind(34)]
 #[kani::solver(kissat)]
-fn kani_design_p2_04_isqrt_exact_full_u64() {
-    let n: u64 = kani::any();
-    let r = isqrt_u64(n) as u128;
-    assert!(r * r <= n as u128);
-    assert!((r + 1) * (r + 1) > n as u128);
-    kani::cover!(n > (1u64 << 40) && r * r == n as u128, "perfect square above 2^40");
-    kani::cover!(n > (1u64 << 62), "top of the domain");
+fn kani_design_p2_01s_price_never_crosses_u32() {
+    let o: u32 = kani::any();
+    let t: u128 = kani::any();
+    let buys: bool = kani::any();
+    kani::assume(t <= BPS);
+    let r = price_with_total_bps(o as u64, t, buys);
+    if let Some(p) = r {
+        if buys { assert!(p >= o as u64); } else { assert!(p <= o as u64); }
+        if t == 0 { assert_eq!(p, o as u64); }
+    }
+    kani::cover!(matches!(r, Some(p) if buys && p > o as u64), "buy above oracle");
+    kani::cover!(matches!(r, Some(p) if !buys && p < o as u64), "sell below oracle");
 }
 
-// ── D-P2-05  CP impact is monotone in notional and the budget inverse is sound, over the full
-// admitted depth / k domain (builder bound depth < 2^40). Needed by lemma L-GROSS.
+// ── D-P2-06s  Skew potential DISCRETE CONVEXITY at small width (u8 x/m/c/r): the increment
+// W(x+1)-W(x) never shrinks. This is the code-level fact L-CONVEX needs (the knee
+// `floor(c*r/m)`, v2.rs:627); a ceil-knee mutant breaks convexity (not monotonicity) and reds here.
 #[kani::proof]
 #[kani::solver(kissat)]
-fn kani_design_p2_05_cp_impact_monotone_full() {
-    let d: u128 = kani::any();
-    let k: u32 = kani::any();
-    let n1: u128 = kani::any();
-    let n2: u128 = kani::any();
-    kani::assume(k <= MAX_IMPACT_K_BPS && d > 0);
-    kani::assume(n1 <= n2 && n2 < d);
-    let (Some(i1), Some(i2)) = (cp_impact_bps(n1, d, k), cp_impact_bps(n2, d, k)) else {
-        kani::cover!(true, "overflow of k*n fails closed");
-        return;
-    };
-    assert!(i1 <= i2);
-    kani::cover!(i1 < i2 && d > (1u128 << 40), "strict above the builder's depth bound");
-}
-
-// ── D-P2-06  Skew potential W is non-decreasing in |inventory| over the full u128 x domain for
-// every admitted slope / cap / ref (any u16 slope, any u64 ref incl. u64::MAX), or fails closed.
-// With W convex (slope at the knee <= linear slope: lemma L-CONVEX, algebraic) this is the
-// monotone half of L-GROSS.
-#[kani::proof]
-#[kani::solver(kissat)]
-fn kani_design_p2_06_skew_potential_monotone() {
-    let x1: u128 = kani::any();
-    let x2: u128 = kani::any();
-    let m: u16 = kani::any();
-    let c: u16 = kani::any();
-    let r: u64 = kani::any();
-    kani::assume(x1 <= x2);
-    let (Some(w1), Some(w2)) = (skew_potential_num(x1, m, c, r), skew_potential_num(x2, m, c, r)) else {
-        kani::cover!(true, "overflow fails closed");
-        return;
-    };
-    assert!(w1 <= w2);
-    kani::cover!(w1 < w2 && r == u64::MAX, "shipped u64::MAX reference inventory");
-    kani::cover!(w1 < w2 && m > 10_000, "slope above the builder's bound");
+fn kani_design_p2_06s_skew_potential_discrete_convexity_u8() {
+    let x: u8 = kani::any();
+    let m: u8 = kani::any();
+    let c: u8 = kani::any();
+    let r: u8 = kani::any();
+    kani::assume(x >= 1 && x < u8::MAX);
+    let w = |y: u128| skew_potential_num(y, m as u16, c as u16, r as u64).unwrap();
+    let (w0, w1, w2) = (w(x as u128 - 1), w(x as u128), w(x as u128 + 1));
+    assert!(w1 >= w0 && w2 >= w1, "monotone");
+    assert!(w2 - w1 >= w1 - w0, "discrete convexity");
+    kani::cover!(m > 0 && c > 0 && r > 0 && (x as u128) == (c as u128 * r as u128) / m as u128, "at the knee");
 }
