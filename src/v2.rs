@@ -1420,3 +1420,9 @@ mod proofs {
         kani::cover!(st == MarkState::Stale);
     }
 }
+
+// Sentinel design proofs 2026-09-30 (cfg(kani) only; a child module so private fns can be
+// called and stubbed without widening their visibility).
+#[cfg(kani)]
+#[path = "v2_design_proofs.rs"]
+mod design_proofs;
