@@ -4041,3 +4041,9 @@ mod proofs {
         );
     }
 }
+
+// Sentinel design proofs 2026-09-30: REAL kind-0/1 execution (cfg(kani) child module so the
+// private compute_* fns are called in place).
+#[cfg(kani)]
+#[path = "vamm_design_proofs.rs"]
+mod design_proofs;
