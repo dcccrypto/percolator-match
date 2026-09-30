@@ -213,3 +213,64 @@ fn kani_design_p2_06s_skew_potential_discrete_convexity_u8() {
     assert!(w2 - w1 >= w1 - w0, "discrete convexity");
     kani::cover!(m > 0 && c > 0 && r > 0 && (x as u128) == (c as u128 * r as u128) / m as u128, "at the knee");
 }
+
+// ── D-P2-02b / D-P2-03b  Restructured after D-P2-02/03 had NO VERDICT at 15 min (stuck in
+// propositional reduction: the 130-iteration unwinding of the size-clip binary search in
+// `quote_adaptive` was being solved whole). The search is a width-independent bisection whose
+// correctness is lemma L-SEARCH (paper: invariant gross(lo) <= max < gross(hi), hi − lo halves,
+// terminates with lo = the largest feasible fill). Kani proves the PRODUCTION loop exactly on
+// requests < 2^20 (20 bisection steps; `#[kani::unwind(23)]`, and Kani's unwinding assertion
+// proves the loop exits within the bound), every other field unconstrained, same stubs and
+// assertions as D-P2-02/03. The size bound narrows only the iteration count, not the pricing:
+// never-cross depends on the total, not on how the fill was found.
+#[kani::proof]
+#[kani::unwind(23)]
+#[kani::stub(impact_and_skew, stub_impact_and_skew_any)]
+#[kani::stub(gross_pos_bps, stub_gross_any)]
+#[kani::stub(price_with_total_bps, spec_price_with_total_bps)]
+fn kani_design_p2_02b_quote_never_crosses_bounded_search() {
+    let q = any_quote_admitted();
+    kani::assume(q.fill < (1u128 << 20));
+    let r = quote_adaptive(&q);
+    if let Some((fill, price, total)) = r {
+        assert!(fill <= q.fill);
+        assert!(total <= (q.max_total_bps as u128).min(9_000));
+        if fill == 0 {
+            assert_eq!(price, q.oracle_e6);
+            assert_eq!(total, 0);
+        } else if q.taker_buys {
+            assert!(price >= q.oracle_e6);
+        } else {
+            assert!(price <= q.oracle_e6);
+        }
+        kani::cover!(fill > 0 && fill < q.fill, "size clip exercised");
+        kani::cover!(fill > 0 && q.taker_buys && price > q.oracle_e6, "buy priced above oracle");
+        kani::cover!(fill > 0 && !q.taker_buys && price < q.oracle_e6, "sell priced below oracle");
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(23)]
+#[kani::stub(impact_and_skew, stub_impact_and_skew_any)]
+#[kani::stub(gross_pos_bps, stub_gross_threshold)]
+#[kani::stub(price_with_total_bps, spec_price_with_total_bps)]
+fn kani_design_p2_03b_fill_monotone_bounded_search() {
+    let t: u128 = kani::any();
+    unsafe { THRESHOLD = t };
+    let q = any_quote_admitted();
+    let bigger: u128 = kani::any();
+    kani::assume(q.fill <= bigger && bigger < (1u128 << 20));
+    let mut q2 = q;
+    q2.fill = bigger;
+    let r1 = quote_adaptive(&q);
+    let r2 = quote_adaptive(&q2);
+    if let (Some((f1, _, _)), Some((f2, _, _))) = (r1, r2) {
+        assert!(f1 <= f2, "a larger request never fills less");
+        let lp_reduces = (q.taker_buys && q.inv_pre > 0) || (!q.taker_buys && q.inv_pre < 0);
+        let base = q.fill.min(t);
+        let expect = if lp_reduces { base.max(q.fill.min(q.inv_pre.unsigned_abs())) } else { base };
+        assert_eq!(f1, expect, "bisection returns exactly the feasible prefix");
+        kani::cover!(f1 < q.fill && !lp_reduces && f1 > 0, "clipped to the feasible prefix");
+        kani::cover!(lp_reduces && f1 > t, "reducing exemption fills past the clip");
+    }
+}
