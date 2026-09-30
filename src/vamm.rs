@@ -3808,6 +3808,7 @@ mod proofs {
                 let impact_bps = impact_numer / liquidity_notional_e6;
                 // Impact bps should be bounded (at most fill the cap)
                 assert!(impact_bps <= u128::MAX);
+                kani::cover!(true, "Sentinel 2026-09-30: inner impact path reached");
             }
             // If checked_mul returns None, the program returns ArithmeticOverflow — safe.
         }
@@ -3871,6 +3872,8 @@ mod proofs {
             new_inv,
             max_inv
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// Proof 3: insurance_accrued_e6 never exceeds (a fraction of) the trading fee
@@ -3935,6 +3938,8 @@ mod proofs {
             insurance_fee,
             full_trading_fee
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // =========================================================================
@@ -3958,6 +3963,8 @@ mod proofs {
             exec_price >= oracle as u128,
             "buy exec price must be >= oracle price"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// Proof 5: sell exec_price <= oracle_price (LP charges spread on sells).
@@ -3977,6 +3984,8 @@ mod proofs {
             exec_price <= oracle as u128,
             "sell exec price must be <= oracle price"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// Proof 6: inventory limit reduces fill when limit would be breached.
@@ -4007,6 +4016,8 @@ mod proofs {
             fill_abs <= fill_req,
             "fill must not exceed requested amount"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// Proof 7: impact_bps monotonically increases with fill size.
@@ -4038,6 +4049,8 @@ mod proofs {
         let impact2 = notional2.saturating_mul(impact_k_bps as u128) / liquidity;
 
         assert!(impact2 >= impact1, "larger fills must produce >= impact");
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// Proof 8: skew extra spread capped at 5000 bps.
@@ -4061,6 +4074,8 @@ mod proofs {
             extra <= 5000,
             "skew extra spread must be capped at 5000 bps"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// Proof 9: passive spread never produces zero exec_price for valid oracle.
@@ -4103,6 +4118,8 @@ mod proofs {
             sell_price > 0,
             "sell exec_price must always be > 0 for valid oracle"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     /// Proof 10: total_bps never exceeds max_total_bps.
@@ -4126,6 +4143,8 @@ mod proofs {
             total_bps <= max_total,
             "total bps must never exceed max_total_bps"
         );
+            // Sentinel 2026-09-30: vacuity detector for the assume set.
+        kani::cover!(true, "assume set satisfiable; asserted path reached");
     }
 
     // =========================================================================
@@ -4155,6 +4174,7 @@ mod proofs {
                     exec_price >= oracle_u128,
                     "buy exec_price (ceil div) must be >= oracle"
                 );
+                kani::cover!(true, "Sentinel 2026-09-30: rounded price path reached");
             }
         }
     }
