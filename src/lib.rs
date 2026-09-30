@@ -4,6 +4,8 @@ extern crate alloc;
 
 pub mod passive_lp_matcher;
 pub mod v2;
+#[cfg(kani)]
+mod v2_review_proofs;
 pub mod vamm;
 
 pub use passive_lp_matcher::*;
