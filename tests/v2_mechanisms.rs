@@ -1135,7 +1135,10 @@ fn exec_band_bounds_quote_and_control() {
     // kind 1: the spread clamps at the band
     let mut k1 = core_ctx(1);
     k1.skew_spread_mult_bps = 10_000;
-    k1.inventory_base = -1_000_000_000;
+    // Skew is normalised to max_inventory_abs (live M-1): put the LP at full inventory so the
+    // skew (5000 cap) drives the quote wide (leaving room for the 10-unit fill).
+    k1.max_inventory_abs = 1_000_000_000;
+    k1.inventory_base = -999_999_000;
     let wide = execute_leg(&mut k1.clone(), &call(PX, 10), &CallExt::default(), None, 0).unwrap();
     let narrow = execute_leg(&mut k1.clone(), &call(PX, 10), &band(50), None, 0).unwrap();
     assert!(bps(wide.exec_price_e6) > 50);

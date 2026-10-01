@@ -493,8 +493,11 @@ fn kind1_skew_reference_is_the_v3_effective_cap() {
 }
 
 #[test]
-fn kind1_skew_without_cap_reference_is_legacy() {
-    // unlimited (0) and the i128::MAX sentinel keep the legacy units byte for byte
+fn kind1_skew_without_cap_reference_is_inert_m1() {
+    // v2.1 (M-1 for every call kind): `skew_spread_mult_bps` is the extra bps at FULL
+    // inventory, normalised to `max_inventory_abs`. Unlimited (0) has no reference inventory,
+    // so the skew is inert; the i128::MAX sentinel makes 1,000 Q a ~0 share of M (shift branch).
+    // The retired legacy form (|inv| * mult / 10_000) priced 10 bps here.
     for cap in [0u128, i128::MAX as u128] {
         let mut c = ctx(1, 1_000, cap);
         c.max_total_bps = 9_000;
@@ -503,8 +506,8 @@ fn kind1_skew_without_cap_reference_is_legacy() {
         let s = run(&c, &call_v2(-1, 1_000)).unwrap();
         c.skew_spread_mult_bps = 0;
         let p = run(&c, &call_v2(-1, 1_000)).unwrap();
-        // legacy: 1,000 * 100 / 10,000 = 10 bps
-        assert_eq!(p.exec_price_e6 - s.exec_price_e6, 100_000, "cap {cap}");
+        assert_eq!(p.exec_price_e6 - s.exec_price_e6, 0, "cap {cap}");
+        // negative control: the retired formula WOULD have charged 10 bps (100_000 e6 at $100)
         assert_eq!(legacy_skew(1_000, 100), 10);
     }
 }
@@ -534,10 +537,11 @@ fn v3_effective_helpers() {
 
 // ── security review 2026-10-04: L-1 opt-in units, L-5 neutral caps, M-1 close exemption ──
 
-/// L-1: the kind-1 unit fix is OPT-IN. A legacy / v1 / v2 call on a finite-cap kind-1 context
-/// keeps the deployed formula byte for byte (the live HqLMqhtM... context is unchanged).
+/// M-1 (supersedes growth L-1's opt-in): the normalised skew units apply to EVERY kind-1 call
+/// (legacy v1, v2 and v3 alike) -- v2.1 has fresh program IDs, so no legacy context needs the
+/// retired `|inv| * mult / 10_000` form. All three ABI generations price identically.
 #[test]
-fn l1_kind1_units_only_under_an_active_v3_cap() {
+fn m1_kind1_units_apply_to_every_call_generation() {
     let cap: u128 = 10_000_000_000_000;
     let inv: i128 = 1_000_000_000_000;
     let mut c = ctx(1, inv, cap);
@@ -549,21 +553,58 @@ fn l1_kind1_units_only_under_an_active_v3_cap() {
     let v3 = run(&c, &call_v3(-1, inv, cap, u128::MAX)).unwrap();
     c.skew_spread_mult_bps = 0;
     let plain = run(&c, &call_v2(-1, inv)).unwrap();
-    // legacy: 1e12 * 100 / 1e4 -> saturates at 5000 bps
-    assert_eq!(
+    // 10% of M -> 10 bps at $100 = 100_000 e6, for every call generation
+    for (name, o) in [("v1", &v1), ("v2", &v2), ("v3", &v3)] {
+        assert_eq!(plain.exec_price_e6 - o.exec_price_e6, 100_000, "{name}");
+    }
+    assert_eq!(v1.exec_price_e6, v2.exec_price_e6);
+    assert_eq!(v2.exec_price_e6, v3.exec_price_e6);
+    // negative control: the retired legacy units saturated at 5000 bps (50_000_000 e6)
+    assert_eq!(legacy_skew(inv.unsigned_abs(), 100), 5_000);
+    assert_ne!(
         plain.exec_price_e6 - v2.exec_price_e6,
         50_000_000,
-        "v2: legacy units"
+        "legacy saturation is gone"
     );
+}
+
+/// M-1 on kind 0 (passive): same ramp, same units, every call generation; the retired form
+/// (negative control) would have saturated at the 5000 bps clamp / max_total.
+#[test]
+fn m1_kind0_skew_ramp_matches_kind1_and_clamps_at_m() {
+    let cap: u128 = 10_000_000_000_000;
+    let inv: i128 = 1_000_000_000_000;
+    let mut c = ctx(0, inv, cap);
+    c.max_total_bps = 9_000;
+    c.skew_spread_mult_bps = 100;
+    let v1 = run(&c, &call_v1(-1)).unwrap();
+    let v2 = run(&c, &call_v2(-1, inv)).unwrap();
+    c.skew_spread_mult_bps = 0;
+    let plain = run(&c, &call_v2(-1, inv)).unwrap();
     assert_eq!(
-        v1.exec_price_e6, v2.exec_price_e6,
-        "v1 == v2 (same inventory)"
-    );
-    // v3 with an active cap: 10% of cap -> 10 bps
-    assert_eq!(
-        plain.exec_price_e6 - v3.exec_price_e6,
+        plain.exec_price_e6 - v1.exec_price_e6,
         100_000,
-        "v3: new units"
+        "10% of M -> 10 bps"
+    );
+    assert_eq!(v1.exec_price_e6, v2.exec_price_e6);
+    assert_ne!(
+        plain.exec_price_e6 - v2.exec_price_e6,
+        50_000_000,
+        "legacy saturation is gone"
+    );
+    // inventory beyond M clamps at the multiplier (100 bps), never above it
+    let big: i128 = (cap as i128) * 3;
+    let mut b = ctx(0, big, cap * 4);
+    b.max_total_bps = 9_000;
+    b.skew_spread_mult_bps = 100;
+    let sk = run(&b, &call_v2(-1, big)).unwrap();
+    b.skew_spread_mult_bps = 0;
+    let pl = run(&b, &call_v2(-1, big)).unwrap();
+    // 3e13 of M = 4e13 -> 75 bps
+    assert_eq!(
+        pl.exec_price_e6 - sk.exec_price_e6,
+        750_000,
+        "75% of M -> 75 bps"
     );
 }
 

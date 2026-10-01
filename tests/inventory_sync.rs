@@ -356,8 +356,10 @@ fn v2_carries_headroom_and_band_like_v1() {
 fn skew_prices_off_the_real_position() {
     // skew widens the side that worsens inventory; a stale +cap counter makes a SELL look
     // worsening although the LP is really short (selling IMPROVES it)
-    let mut c = ctx(0, 900, 0);
-    c.skew_spread_mult_bps = 10_000; // extra = |inv| bps, capped at 5000
+    // M-1: the skew is normalised to max_inventory_abs (M == 0 is inert), so the context needs a
+    // real cap; 10_000 = +10_000 bps at full inventory (900/CAP of it here), capped at 5000.
+    let mut c = ctx(0, 900, CAP);
+    c.skew_spread_mult_bps = 10_000;
     let stale = run(&c, &call_v1(-10, &CallExt::default())).unwrap();
     let real = run(&c, &call_v2(-10, -900, &CallExt::default())).unwrap();
     assert!(

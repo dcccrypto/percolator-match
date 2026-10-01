@@ -96,7 +96,10 @@ fn configs() -> Vec<(&'static str, InitParams)> {
                 max_fill_abs: 1_000,
                 max_inventory_abs: 5_000,
                 fee_to_insurance_bps: 2_500,
-                skew_spread_mult_bps: 3,
+                // Live M-1 (2026-10-01): kinds 0/1 skew was re-based to max_inventory_abs, an
+                // INTENDED divergence from v1 — byte parity holds with skew off; the skew
+                // divergence is pinned by `skew_divergence_from_v1_is_bounded_and_taker_favourable`.
+                skew_spread_mult_bps: 0,
                 ..base
             },
         ),
@@ -124,7 +127,7 @@ fn configs() -> Vec<(&'static str, InitParams)> {
                 max_fill_abs: 700,
                 max_inventory_abs: 3_000,
                 fee_to_insurance_bps: 5_000,
-                skew_spread_mult_bps: 7,
+                skew_spread_mult_bps: 0, // see the k0 finite config note (live M-1)
                 lp_account_id: LP_ACCOUNT_ID,
             },
         ),
@@ -292,4 +295,62 @@ fn neg_parity_comparator_detects_divergence() {
     let h1 = std::fs::read(v1_so_path()).unwrap();
     let h2 = std::fs::read(v2_so_path()).unwrap();
     assert_ne!(h1, h2, "v1 and v2 .so must be different binaries");
+}
+
+/// Live M-1 (2026-10-01): with skew ON, v2 (skew re-based to max_inventory_abs) diverges from
+/// v1 (skew in raw quantity units, saturating) BY DESIGN. Pin the divergence: the same calls
+/// have the same outcome and fill on both, and v2 never prices worse for the taker than v1
+/// whenever max_inventory_abs >= 10_000 quantity units (new = mult*x/M <= old = mult*x/1e4 —
+/// every real LP: M is in POS_SCALE units, ~1e12 live); at least one fill is strictly better
+/// (non-vacuous).
+#[test]
+fn skew_divergence_from_v1_is_bounded_and_taker_favourable() {
+    for (kind, impact, liq) in [(0u8, 0u32, 0u128), (1, 2_000, 1_000_000_000)] {
+        let p = InitParams {
+            kind,
+            trading_fee_bps: 25,
+            base_spread_bps: 15,
+            max_total_bps: 1_000,
+            impact_k_bps: impact,
+            liquidity_notional_e6: liq,
+            max_fill_abs: 7_000,
+            max_inventory_abs: 30_000,
+            fee_to_insurance_bps: 0,
+            skew_spread_mult_bps: 7,
+            lp_account_id: LP_ACCOUNT_ID,
+        };
+        let mut v1 = Env::v1();
+        let mut v2 = Env::v2();
+        let lp = seeded_keypair(10);
+        let ctx = Pubkey::new_from_array([0x90 + kind; 32]);
+        v1.alloc_ctx(ctx);
+        v2.alloc_ctx(ctx);
+        assert!(v1.init(&lp, &ctx, &p).is_ok() && v2.init(&lp, &ctx, &p).is_ok());
+        let mut rng = Rng(0x5eed ^ kind as u64);
+        let mut strictly_better = 0usize;
+        for i in 0..64u64 {
+            let mag = rng.range(1, 7_000) as i128;
+            // Bias toward building inventory so the skew side is exercised.
+            let size = if i % 4 == 3 { -mag } else { mag };
+            let c = Call::new(2000 + i, 50_000_000, size);
+            let r1 = v1.send(&lp, true, &ctx, c.encode());
+            let r2 = v2.send(&lp, true, &ctx, c.encode());
+            assert_eq!(r1.is_ok(), r2.is_ok(), "outcome diverged at call {i}");
+            if r1.is_err() {
+                continue;
+            }
+            let a = decode_return(&v1.ctx_data(&ctx)[..64]);
+            let b = decode_return(&v2.ctx_data(&ctx)[..64]);
+            assert_eq!(a.exec_size, b.exec_size, "fill diverged at call {i}");
+            if size > 0 {
+                assert!(b.exec_price_e6 <= a.exec_price_e6, "v2 buy worse than v1 at {i}");
+            } else {
+                assert!(b.exec_price_e6 >= a.exec_price_e6, "v2 sell worse than v1 at {i}");
+            }
+            if b.exec_price_e6 != a.exec_price_e6 {
+                strictly_better += 1;
+            }
+        }
+        assert!(strictly_better > 0, "kind {kind}: the skew divergence must be exercised");
+    }
 }
