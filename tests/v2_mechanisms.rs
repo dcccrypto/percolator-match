@@ -134,6 +134,7 @@ fn ext_roundtrip_and_legacy() {
         accepts_fee_request: true,
         taker_reducing: true,
         exec_band_bps: Some(500),
+        lp_position_q: None,
     };
     assert_eq!(CallExt::parse(&e.encode()).unwrap(), e);
     assert_eq!(CallExt::parse(&[0u8; 24]).unwrap(), CallExt::default());

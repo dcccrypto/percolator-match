@@ -30,6 +30,7 @@ fn main() {
         accepts_fee_request: true,
         taker_reducing: true,
         exec_band_bps: Some(500),
+        lp_position_q: None,
     };
     let cfg = v2::default_config_for_kind2(10, 50, 200, 50, 4_000);
     let sp = SetParams {

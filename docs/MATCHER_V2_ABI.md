@@ -203,3 +203,37 @@ Requests to P1:
 2. Set `TAKER_REDUCING` when the leg only reduces the taker's position. Without it, a taker whose close *grows* the LP's inventory is refused under a stale mark.
 3. Leave `ACCEPTS_FEE_REQUEST` off until the wrapper accepts return bits 22..31 and routes the fee.
 4. Keep `matcher_ext_mode = 0` until the matcher program on that asset is upgraded to v2. The deployed `12bd671` rejects non-zero bytes 43..67.
+
+## 10. Version-2 extension: the LP's real engine position (matcher-inventory-sync, 2026-10-03)
+
+**Why.** `inventory_base` only moves on matcher fills. Every out-of-matcher change of the LP's
+engine position leaves it stale: a liquidation or `RebalanceReduce` (tag 44) of an account on the
+opposite side ADL-scales the LP's leg, a full drain resets the LP's side to zero, and the LP's own
+liquidation, force-close or a no-CPI trade moves it directly. On devnet (wrapper `ETDLAdi…` @
+`553d76f0`, matcher `EDKKgRaV…` @ `4a0f696`) 11 of 44 bound contexts had drifted on 2026-10-03.
+A stale counter both blocks fills the LP has room for (phantom cap) and admits fills past the
+LP's configured cap (upstream `aeyakovenko/percolator-prog#406`). The single scalar also nets
+fills across assets (`aeyakovenko/percolator-match#8`).
+
+**Wire.** `ext_version = 2` is 40 bytes: bytes 0..24 are the v1 block (same flags, same
+field-without-flag and reserved-byte rules; flags may be 0), bytes 24..40 are `lp_position_q`,
+the LP's signed ADL-effective engine position on THIS leg's asset (i128 LE, `i128::MIN` refused).
+
+| call | legacy | v1 | v2 |
+|---|---|---|---|
+| tag 0 | 67 bytes, ext all-zero | 67 bytes | **exactly 83 bytes** (43 + 40) |
+| tag 3 | `18 + 26n` | `18 + 26n + 24n` | `18 + 26n + 40n` (never mixed) |
+
+**Semantics.** Tag 0: `inventory_base := lp_position_q` before pricing, then the fill applies as
+before, so the stored counter is re-synchronised by every v2 fill. Tag 3: every leg carries the
+PRE-batch position of its asset; leg `i` prices from `lp_position_q - sum(exec_size of earlier
+legs on the same asset)`, so legs on different assets never net. Pricing (skew), the inventory
+cap and the stale-mark LP-reducing clip all read the real position. Only the wrapper can sign for
+`lp_pda`, so the field is authenticated.
+
+**Compatibility.** A v0/v1 call behaves exactly as before (the stale counter). With no drift a
+v2 call is byte-identical in its return and stored counter to the v1 call (tests
+`inventory_sync.rs::v2_with_accurate_counter_is_identical_to_v1`). The deployed `4a0f696`
+rejects version 2 with `InvalidInstructionData`: **upgrade the matcher before the wrapper that
+sends v2.** The wrapper sends v2 only to the canonical matcher program; any other matcher keeps
+receiving v0/v1.

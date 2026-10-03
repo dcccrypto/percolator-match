@@ -45,6 +45,15 @@ pub const ERR_OWNER_PROOF_MISMATCH: u32 = 8005;
 pub const CALL_EXT_OFFSET: usize = 43;
 pub const CALL_EXT_LEN: usize = 24;
 pub const CALL_EXT_VERSION_V1: u8 = 1;
+/// Matcher-inventory-sync (2026-10-03): version 2 = the v1 block followed by the LP's REAL
+/// signed engine position on this leg's asset (i128, bytes 24..40), attested by the wrapper.
+/// When present the matcher prices and caps against that position instead of its own
+/// `inventory_base` counter, which liquidations, ADL scaling, side resets and every other
+/// out-of-matcher position change leave stale (upstream percolator-prog#406,
+/// percolator-match#8). Only the wrapper can sign for `lp_pda`, so the field is authenticated.
+pub const CALL_EXT_VERSION_V2: u8 = 2;
+/// Length of a version-2 call extension (v1 block + i128 LP position).
+pub const CALL_EXT_V2_LEN: usize = 40;
 /// `lp_headroom_q` is present.
 pub const EXT_FLAG_HEADROOM: u8 = 1 << 0;
 /// `mark_slot` is present.
@@ -90,6 +99,9 @@ pub struct CallExt {
     pub accepts_fee_request: bool,
     pub taker_reducing: bool,
     pub exec_band_bps: Option<u16>,
+    /// v2 only: the LP's real signed engine position on this leg's asset before this call
+    /// (before this batch, for tag 3). `None` for v0/v1 blocks.
+    pub lp_position_q: Option<i128>,
 }
 
 impl CallExt {
@@ -130,8 +142,37 @@ impl CallExt {
                     accepts_fee_request: flags & EXT_FLAG_ACCEPTS_FEE_REQUEST != 0,
                     taker_reducing: flags & EXT_FLAG_TAKER_REDUCING != 0,
                     exec_band_bps: (flags & EXT_FLAG_EXEC_BAND != 0).then_some(band),
+                    lp_position_q: None,
                 })
             }
+            _ => Err(ProgramError::InvalidInstructionData),
+        }
+    }
+
+    /// Parse a 40-byte version-2 block: the first 24 bytes follow every v1 rule (flags,
+    /// field-without-flag, reserved 20..24), the last 16 are the LP position. `i128::MIN`
+    /// is refused (its magnitude is not representable and no real position reaches it).
+    pub fn parse_v2(b: &[u8]) -> Result<Self, ProgramError> {
+        if b.len() != CALL_EXT_V2_LEN || b[0] != CALL_EXT_VERSION_V2 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let mut v1 = [0u8; CALL_EXT_LEN];
+        v1.copy_from_slice(&b[..CALL_EXT_LEN]);
+        v1[0] = CALL_EXT_VERSION_V1;
+        let mut ext = Self::parse(&v1)?;
+        let pos = i128::from_le_bytes(b[CALL_EXT_LEN..CALL_EXT_V2_LEN].try_into().unwrap());
+        if pos == i128::MIN {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        ext.lp_position_q = Some(pos);
+        Ok(ext)
+    }
+
+    /// Parse either a 24-byte (v0/v1) or a 40-byte (v2) block, by length.
+    pub fn parse_any(b: &[u8]) -> Result<Self, ProgramError> {
+        match b.len() {
+            CALL_EXT_LEN => Self::parse(b),
+            CALL_EXT_V2_LEN => Self::parse_v2(b),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
@@ -142,13 +183,35 @@ impl CallExt {
             && !self.accepts_fee_request
             && !self.taker_reducing
             && self.exec_band_bps.is_none()
+            && self.lp_position_q.is_none()
     }
 
+    /// Encode as a version-2 block. `lp_position_q` must be `Some`.
+    pub fn encode_v2(&self) -> [u8; CALL_EXT_V2_LEN] {
+        let pos = self.lp_position_q.expect("encode_v2 needs lp_position_q");
+        let mut b = [0u8; CALL_EXT_V2_LEN];
+        let mut v1 = *self;
+        v1.lp_position_q = None;
+        // `encode` returns all-zero for a block with no v1 field; v2 still carries version 2.
+        b[..CALL_EXT_LEN].copy_from_slice(&v1.encode_v1_fields());
+        b[0] = CALL_EXT_VERSION_V2;
+        b[CALL_EXT_LEN..].copy_from_slice(&pos.to_le_bytes());
+        b
+    }
+
+    /// Encode as a 24-byte v0/v1 block. A v2-only field (`lp_position_q`) cannot be
+    /// represented here and is not encoded; use [`Self::encode_v2`].
     pub fn encode(&self) -> [u8; CALL_EXT_LEN] {
-        let mut b = [0u8; CALL_EXT_LEN];
-        if self.is_legacy() {
-            return b;
+        let mut v1 = *self;
+        v1.lp_position_q = None;
+        if v1.is_legacy() {
+            return [0u8; CALL_EXT_LEN];
         }
+        v1.encode_v1_fields()
+    }
+
+    fn encode_v1_fields(&self) -> [u8; CALL_EXT_LEN] {
+        let mut b = [0u8; CALL_EXT_LEN];
         b[0] = CALL_EXT_VERSION_V1;
         let mut flags = 0u8;
         if let Some(s) = self.mark_slot {

@@ -82,6 +82,8 @@ pub const MATCHER_BATCH_MAX_LEGS: usize = 16;
 // Matcher Call Layout (67 bytes) - Tag 0
 // =============================================================================
 pub const MATCHER_CALL_LEN: usize = 67;
+/// Tag-0 call carrying a version-2 (40-byte) call extension: 43 + 40.
+pub const MATCHER_CALL_V2_LEN: usize = 83;
 
 // =============================================================================
 // Matcher Return Layout (64 bytes)
@@ -292,8 +294,9 @@ impl MatcherCall {
 
         // P2: bytes 43..67 were "must be zero". All-zero is still the legacy call; an
         // `ext_version == 1` block carries the wrapper's mark_slot / LP headroom
-        // (`v2::CallExt`). Anything else is rejected, exactly as before.
-        v2::CallExt::parse(&data[v2::CALL_EXT_OFFSET..v2::CALL_EXT_OFFSET + v2::CALL_EXT_LEN])?;
+        // (`v2::CallExt`); `ext_version == 2` (bytes 43..83) adds the LP's real engine
+        // position. Anything else is rejected, exactly as before.
+        Self::parse_ext(data)?;
 
         Ok(Self {
             req_id,
@@ -304,10 +307,20 @@ impl MatcherCall {
         })
     }
 
-    /// Parse the 24-byte call extension (bytes 43..67). All-zero == legacy.
+    /// Parse the call extension. Bytes 43..67 (24-byte v0/v1 block; all-zero == legacy), or,
+    /// when byte 43 is `CALL_EXT_VERSION_V2`, bytes 43..83 (v1 block + LP engine position).
+    /// A v2 call must be exactly `MATCHER_CALL_V2_LEN` bytes.
     pub fn parse_ext(data: &[u8]) -> Result<v2::CallExt, ProgramError> {
         if data.len() < MATCHER_CALL_LEN {
             return Err(ProgramError::InvalidInstructionData);
+        }
+        if data[v2::CALL_EXT_OFFSET] == v2::CALL_EXT_VERSION_V2 {
+            if data.len() != MATCHER_CALL_V2_LEN {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            return v2::CallExt::parse_v2(
+                &data[v2::CALL_EXT_OFFSET..v2::CALL_EXT_OFFSET + v2::CALL_EXT_V2_LEN],
+            );
         }
         v2::CallExt::parse(&data[v2::CALL_EXT_OFFSET..v2::CALL_EXT_OFFSET + v2::CALL_EXT_LEN])
     }

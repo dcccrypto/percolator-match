@@ -728,6 +728,14 @@ pub fn process_call_with_clock(
         return Err(ProgramError::InvalidInstructionData);
     }
 
+    // Matcher-inventory-sync: a v2 extension carries the LP's REAL engine position (wrapper-
+    // attested; only the wrapper can sign for lp_pda). Price and cap against it instead of
+    // the stored counter, which every out-of-matcher position change (liquidation, ADL,
+    // side reset, RebalanceReduce, force-close, no-CPI trades) leaves stale. `apply_fill`
+    // then advances it by this fill, so the stored counter is re-synchronised as a side effect.
+    if let Some(p) = ext.lp_position_q {
+        ctx.inventory_base = p;
+    }
     let now = if ctx.v2_block().is_some() {
         Some(slot_source()?)
     } else {
@@ -1012,12 +1020,15 @@ pub fn process_batch_call_with_clock(
     if n == 0 || n > MATCHER_BATCH_MAX_LEGS {
         return Err(ProgramError::InvalidInstructionData);
     }
-    // P2: legacy length (legs only) or legs + one 24-byte call extension per leg.
+    // P2: legacy length (legs only), legs + one 24-byte call extension per leg, or (matcher-
+    // inventory-sync) legs + one 40-byte version-2 extension per leg. Never mixed.
     let legs_end = MATCHER_BATCH_HEADER_LEN + n * MATCHER_BATCH_LEG_LEN;
-    let has_ext = if instruction_data.len() == legs_end {
-        false
+    let ext_len = if instruction_data.len() == legs_end {
+        0
     } else if instruction_data.len() == legs_end + n * v2::CALL_EXT_LEN {
-        true
+        v2::CALL_EXT_LEN
+    } else if instruction_data.len() == legs_end + n * v2::CALL_EXT_V2_LEN {
+        v2::CALL_EXT_V2_LEN
     } else {
         return Err(ProgramError::InvalidInstructionData);
     };
@@ -1112,6 +1123,10 @@ pub fn process_batch_call_with_clock(
     let mut used_count = 0usize;
 
     let mut returns = [0u8; MATCHER_BATCH_MAX_LEGS * MATCHER_RETURN_LEN];
+    // Signed fills per asset so far in this batch (v2 legs derive inventory from these).
+    let mut batch_asset_fills: [(u16, i128); MATCHER_BATCH_MAX_LEGS] =
+        [(0, 0); MATCHER_BATCH_MAX_LEGS];
+    let mut batch_asset_fill_count = 0usize;
     for i in 0..n {
         // #13: Reset per-leg insurance remainder. Each leg is an independent fill;
         // the fractional carry-over from the previous leg must not bleed into the
@@ -1131,12 +1146,28 @@ pub fn process_batch_call_with_clock(
         if req_size == i128::MIN {
             return Err(ProgramError::InvalidInstructionData);
         }
-        let ext = if has_ext {
-            let eb = legs_end + i * v2::CALL_EXT_LEN;
-            CallExt::parse(&instruction_data[eb..eb + v2::CALL_EXT_LEN])?
+        let ext = if ext_len != 0 {
+            let eb = legs_end + i * ext_len;
+            CallExt::parse_any(&instruction_data[eb..eb + ext_len])?
         } else {
             CallExt::default()
         };
+        // Matcher-inventory-sync: every v2 leg carries the LP's PRE-BATCH real position on its
+        // asset. Inventory for this leg = that position moved by the fills of the earlier legs
+        // of this batch on the SAME asset (buy from user => LP sells => inventory decreases).
+        // Keyed by asset, so fills in different assets no longer net against each other
+        // (percolator-match#8).
+        if let Some(p) = ext.lp_position_q {
+            let mut inv = p;
+            for &(a, filled_signed) in batch_asset_fills.iter().take(batch_asset_fill_count) {
+                if a == asset_index {
+                    inv = inv
+                        .checked_sub(filled_signed)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                }
+            }
+            ctx.inventory_base = inv;
+        }
         let call = MatcherCall {
             req_id,
             asset_index,
@@ -1153,6 +1184,24 @@ pub fn process_batch_call_with_clock(
         // Use checked_sub (not saturating_sub) so any overflow aborts the batch
         // atomically before the ctx write below — no partial-fill state escapes.
         apply_fill(&mut ctx, &out, oracle_price_e6)?;
+        if out.exec_size != 0 {
+            match batch_asset_fills
+                .iter()
+                .take(batch_asset_fill_count)
+                .position(|&(a, _)| a == asset_index)
+            {
+                Some(k) => {
+                    batch_asset_fills[k].1 = batch_asset_fills[k]
+                        .1
+                        .checked_add(out.exec_size)
+                        .ok_or(ProgramError::ArithmeticOverflow)?;
+                }
+                None => {
+                    batch_asset_fills[batch_asset_fill_count] = (asset_index, out.exec_size);
+                    batch_asset_fill_count += 1;
+                }
+            }
+        }
         let filled = out.exec_size.unsigned_abs();
         match slot {
             Some(k) => used[k].2 = used[k].2.saturating_add(filled),
