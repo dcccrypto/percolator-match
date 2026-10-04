@@ -451,9 +451,9 @@ fn kind1_skew_is_bps_per_100pct_of_cap() {
     c.max_total_bps = 9_000;
     c.impact_k_bps = 0;
     c.skew_spread_mult_bps = 100;
-    let skewed = run(&c, &call_v2(-1, inv)).unwrap();
+    let skewed = run(&c, &call_v3(-1, inv, cap, u128::MAX)).unwrap();
     c.skew_spread_mult_bps = 0;
-    let plain = run(&c, &call_v2(-1, inv)).unwrap();
+    let plain = run(&c, &call_v3(-1, inv, cap, u128::MAX)).unwrap();
     // bid side: price = floor(oracle * (1e4 - total) / 1e4); 10 bps more spread at $100 = 0.1
     // dollars = 100,000 e6 lower.
     let diff = plain.exec_price_e6 - skewed.exec_price_e6;
@@ -467,9 +467,9 @@ fn kind1_skew_is_bps_per_100pct_of_cap() {
     h.max_total_bps = 9_000;
     h.impact_k_bps = 0;
     h.skew_spread_mult_bps = 100;
-    let f = run(&h, &call_v2(-1, half)).unwrap();
+    let f = run(&h, &call_v3(-1, half, cap, u128::MAX)).unwrap();
     h.skew_spread_mult_bps = 0;
-    let fp = run(&h, &call_v2(-1, half)).unwrap();
+    let fp = run(&h, &call_v3(-1, half, cap, u128::MAX)).unwrap();
     assert_eq!(f.exec_size, -1);
     assert_eq!(
         fp.exec_price_e6 - f.exec_price_e6,
@@ -487,9 +487,9 @@ fn kind1_skew_reference_is_the_v3_effective_cap() {
     c.impact_k_bps = 0;
     c.skew_spread_mult_bps = 100;
     let with_cap = run(&c, &call_v3(-1, inv, 10_000_000_000_000, u128::MAX)).unwrap();
-    let ctx_ref = run(&c, &call_v2(-1, inv)).unwrap();
-    // 10% of the ext cap => 10 bps; 1% of the ctx cap => 1 bps
-    assert_eq!(ctx_ref.exec_price_e6 - with_cap.exec_price_e6, 90_000);
+    let wider = run(&c, &call_v3(-1, inv, 50_000_000_000_000, u128::MAX)).unwrap();
+    // 10% of a 1e13 ext cap => 10 bps; 2% of a 5e13 ext cap => 2 bps
+    assert_eq!(wider.exec_price_e6 - with_cap.exec_price_e6, 80_000);
 }
 
 #[test]
@@ -530,4 +530,143 @@ fn v3_effective_helpers() {
     assert_eq!(v2::v3_closed_room(-500, true), 0);
     assert_eq!(v2::v3_closed_room(0, true), 0);
     assert_eq!(v2::v3_closed_room(i128::MIN + 1, false), i128::MAX as u128);
+}
+
+// ── security review 2026-10-04: L-1 opt-in units, L-5 neutral caps, M-1 close exemption ──
+
+/// L-1: the kind-1 unit fix is OPT-IN. A legacy / v1 / v2 call on a finite-cap kind-1 context
+/// keeps the deployed formula byte for byte (the live HqLMqhtM... context is unchanged).
+#[test]
+fn l1_kind1_units_only_under_an_active_v3_cap() {
+    let cap: u128 = 10_000_000_000_000;
+    let inv: i128 = 1_000_000_000_000;
+    let mut c = ctx(1, inv, cap);
+    c.max_total_bps = 9_000;
+    c.impact_k_bps = 0;
+    c.skew_spread_mult_bps = 100;
+    let v1 = run(&c, &call_v1(-1)).unwrap();
+    let v2 = run(&c, &call_v2(-1, inv)).unwrap();
+    let v3 = run(&c, &call_v3(-1, inv, cap, u128::MAX)).unwrap();
+    c.skew_spread_mult_bps = 0;
+    let plain = run(&c, &call_v2(-1, inv)).unwrap();
+    // legacy: 1e12 * 100 / 1e4 -> saturates at 5000 bps
+    assert_eq!(
+        plain.exec_price_e6 - v2.exec_price_e6,
+        50_000_000,
+        "v2: legacy units"
+    );
+    assert_eq!(
+        v1.exec_price_e6, v2.exec_price_e6,
+        "v1 == v2 (same inventory)"
+    );
+    // v3 with an active cap: 10% of cap -> 10 bps
+    assert_eq!(
+        plain.exec_price_e6 - v3.exec_price_e6,
+        100_000,
+        "v3: new units"
+    );
+}
+
+/// L-5: the wrapper's neutral pair for non-growth legs of a mixed batch, (1e14, u128::MAX),
+/// is TRULY neutral -- also for a kind-1 context with an unlimited cap and skew on.
+#[test]
+fn l5_neutral_v3_caps_are_neutral_for_unlimited_kind1() {
+    let neutral_cap: u128 = 100_000_000_000_000; // MAX_POSITION_ABS_Q
+                                                 // large inventories so the legacy skew is visible (it saturates at 5000 bps / max_total)
+    for (inv, size) in [
+        (5_000_000_000i128, -300i128),
+        (-5_000_000_000, 300),
+        (1_000_000, -300),
+        (0, 300),
+    ] {
+        let mut c = ctx(1, inv, 0);
+        c.skew_spread_mult_bps = 7;
+        c.max_total_bps = 9_000;
+        let v2 = run(&c, &call_v2(size, inv)).unwrap();
+        let v3 = run(&c, &call_v3(size, inv, neutral_cap, u128::MAX)).unwrap();
+        assert_eq!(
+            v2, v3,
+            "inv {inv}: the neutral pair must price exactly like v2"
+        );
+        let v3_above = run(&c, &call_v3(size, inv, i128::MAX as u128, u128::MAX)).unwrap();
+        assert_eq!(v2, v3_above);
+    }
+}
+
+fn call_v3_reducing(size: i128, lp_pos: i128, cap: u128, liq: u128) -> Vec<u8> {
+    let mut d = vec![0u8; MATCHER_CALL_V3_LEN];
+    head(&mut d, size);
+    let e = CallExt {
+        lp_position_q: Some(lp_pos),
+        taker_reducing: true,
+        ..base_ext()
+    };
+    d[43..115].copy_from_slice(&e.encode_v3(&ExtCapsV3 {
+        inventory_cap_q: cap,
+        liquidity_notional_e6: liq,
+    }));
+    d
+}
+
+/// M-1: a wrapper-verified taker REDUCTION is never clipped for LP capacity: not by the v3
+/// cap, not by closed mode (cap 0), not by the kind-2 size budget. Controls: the identical
+/// call without TAKER_REDUCING is clipped.
+#[test]
+fn m1_taker_reducing_is_never_clipped_for_lp_capacity() {
+    // LP short 1,000 at a 1,000 cap; a thin-side close (user buys 100) grows |LP| to 1,100.
+    for kind in [0u8, 1] {
+        let c = ctx(kind, -1_000, 0);
+        let exempt = run(&c, &call_v3_reducing(100, -1_000, 1_000, u128::MAX)).unwrap();
+        assert_eq!(
+            exempt.exec_size, 100,
+            "kind {kind}: close filled past the cap"
+        );
+        let control = run(&c, &call_v3(100, -1_000, 1_000, u128::MAX)).unwrap();
+        assert_eq!(
+            control.exec_size, 0,
+            "kind {kind}: without the flag the cap clips"
+        );
+        // closed mode (cap 0: h-lock / C_m = 0)
+        let closed = run(&c, &call_v3_reducing(100, -1_000, 0, 0)).unwrap();
+        assert_eq!(
+            closed.exec_size, 100,
+            "kind {kind}: closed mode never traps a close"
+        );
+        let closed_ctl = run(&c, &call_v3(100, -1_000, 0, 0)).unwrap();
+        assert_eq!(closed_ctl.exec_size, 0);
+    }
+    // kind 2: a tiny depth makes the constant-product impact infeasible for this size
+    let k2 = ctx_kind2(-1_000, 1_000_000);
+    let exempt = run(&k2, &call_v3_reducing(500, -1_000, 1_000, 10)).unwrap();
+    assert_eq!(
+        exempt.exec_size, 500,
+        "kind 2: the size budget never clips a close"
+    );
+    // priced at the max-total clamp (400 bps over the oracle for a buy)
+    assert!(
+        exempt.exec_price_e6 >= PX + PX / 10_000 * 400 - 1,
+        "priced at the clamp: {}",
+        exempt.exec_price_e6
+    );
+    let ctl = run(&k2, &call_v3(500, -1_000, 1_000, 10)).unwrap();
+    assert!(
+        ctl.exec_size < 500,
+        "kind 2 control: clipped ({})",
+        ctl.exec_size
+    );
+    // the flag on a v2 call (no v3 caps) changes nothing (legacy semantics unchanged)
+    let legacy = ctx(1, -1_000, 1_000);
+    let mut d = vec![0u8; MATCHER_CALL_V2_LEN];
+    head(&mut d, 100);
+    let e = CallExt {
+        lp_position_q: Some(-1_000),
+        taker_reducing: true,
+        ..base_ext()
+    };
+    d[43..83].copy_from_slice(&e.encode_v2());
+    assert_eq!(
+        run(&legacy, &d).unwrap().exec_size,
+        0,
+        "v2: ctx cap still binds"
+    );
 }

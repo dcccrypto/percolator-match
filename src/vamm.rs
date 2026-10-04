@@ -889,18 +889,32 @@ pub fn execute_leg_caps(
     let is_buy = call.req_size > 0;
     // growth-v19 ext v3: capital-derived caps, never looser than the context.
     let mut skew_ref_cap: Option<u128> = None;
+    // L-5: an ext cap >= SKEW_REF_MAX_INVENTORY_Q (the engine's position bound; the wrapper's
+    // neutral value for non-growth legs of a mixed batch) is "no ext cap": no clip, no unit
+    // change -- the leg prices exactly as it would alone.
+    let cap_active = caps.is_some_and(|c| c.inventory_cap_q < SKEW_REF_MAX_INVENTORY_Q);
+    // M-1 (security review): a wrapper-verified taker REDUCTION is never clipped for LP
+    // capacity -- not by the v3 cap, not by the closed mode, not by the kind-2 size budget.
+    let close_exempt = caps.is_some() && ext.taker_reducing;
     if let Some(c) = caps {
-        match v2::v3_effective_max_inventory(eff.max_inventory_abs, c.inventory_cap_q) {
-            Some(m) => {
-                eff.max_inventory_abs = m;
-                skew_ref_cap = Some(m);
-            }
-            None => {
-                // CLOSED: only a fill that reduces the LP's |inventory| (buy from user => LP
-                // sells => inventory decreases), and only up to flat.
-                let room = v2::v3_closed_room(ctx.inventory_base, is_buy);
-                if eff.max_fill_abs > room {
-                    eff.max_fill_abs = room;
+        if cap_active {
+            match v2::v3_effective_max_inventory(eff.max_inventory_abs, c.inventory_cap_q) {
+                Some(m) => {
+                    if !close_exempt {
+                        eff.max_inventory_abs = m;
+                    }
+                    skew_ref_cap = Some(m);
+                }
+                None => {
+                    // CLOSED: only a fill that reduces the LP's |inventory| (buy from user =>
+                    // LP sells => inventory decreases), and only up to flat -- unless the
+                    // wrapper verified the TAKER only reduces (M-1).
+                    if !close_exempt {
+                        let room = v2::v3_closed_room(ctx.inventory_base, is_buy);
+                        if eff.max_fill_abs > room {
+                            eff.max_fill_abs = room;
+                        }
+                    }
                 }
             }
         }
@@ -948,7 +962,9 @@ pub fn execute_leg_caps(
 
     let out = match kind {
         MatcherKind::Passive | MatcherKind::Vamm => {
-            let (p, sz, fl) = compute_execution(&eff, call)?;
+            // L-1: new skew units only under an ACTIVE v3 cap. A close-exempt (M-1) leg is sized
+            // and priced against the context's own cap (the v3 cap is not applied to it).
+            let (p, sz, fl) = compute_execution_units(&eff, call, cap_active && !close_exempt)?;
             LegOut {
                 exec_price_e6: p,
                 exec_size: sz,
@@ -973,7 +989,7 @@ pub fn execute_leg_caps(
                     cfg.skew_ref_inventory = m64;
                 }
             }
-            compute_adaptive_execution(&eff, call, &cfg, fee)?
+            compute_adaptive_execution(&eff, call, &cfg, fee, close_exempt)?
         }
     };
     if let Some(b) = block {
@@ -987,6 +1003,10 @@ fn compute_adaptive_execution(
     call: &MatcherCall,
     cfg: &V2Config,
     fee_bps: u128,
+    // M-1: a wrapper-verified taker reduction is filled in full (up to max_fill / headroom,
+    // which the wrapper sets to the request), priced at the max-total clamp when the size
+    // budget would have clipped it.
+    close_exempt: bool,
 ) -> Result<LegOut, ProgramError> {
     let req_abs = call.req_size.unsigned_abs();
     let is_buy = call.req_size > 0;
@@ -1022,6 +1042,14 @@ fn compute_adaptive_execution(
         ref_inv: cfg.skew_ref_inventory,
     };
     let (fill, price, _total) = v2::quote_adaptive(&q).ok_or(ProgramError::ArithmeticOverflow)?;
+    let (fill, price) = if close_exempt && fill < fill_abs {
+        let clamp = (eff.max_total_bps as u128).min(9_000);
+        let p = v2::price_with_total_bps(call.oracle_price_e6, clamp, is_buy)
+            .ok_or(ProgramError::ArithmeticOverflow)?;
+        (fill_abs, p)
+    } else {
+        (fill, price)
+    };
     if fill == 0 {
         return Ok(zero);
     }
@@ -1293,9 +1321,18 @@ fn compute_execution(
     ctx: &MatcherCtx,
     call: &MatcherCall,
 ) -> Result<(u64, i128, u32), ProgramError> {
+    compute_execution_units(ctx, call, false)
+}
+
+/// `compute_execution` with the opt-in v3 skew units (L-1).
+fn compute_execution_units(
+    ctx: &MatcherCtx,
+    call: &MatcherCall,
+    v3_units: bool,
+) -> Result<(u64, i128, u32), ProgramError> {
     match ctx.get_kind()? {
-        MatcherKind::Passive => compute_passive_execution(ctx, call),
-        MatcherKind::Vamm => compute_vamm_execution(ctx, call),
+        MatcherKind::Passive => compute_passive_execution(ctx, call, v3_units),
+        MatcherKind::Vamm => compute_vamm_execution(ctx, call, v3_units),
         // Kind 2 is priced only through `execute_leg` (needs the v2 block + clock).
         MatcherKind::Adaptive => Err(ProgramError::InvalidAccountData),
     }
@@ -1309,7 +1346,15 @@ fn compute_execution(
 ///
 /// extra_bps = |inventory| * skew_spread_mult_bps / 10_000
 /// Only applied to the side that worsens inventory.
+#[cfg(any(test, kani))]
 fn compute_skew_extra_bps(ctx: &MatcherCtx, is_buy: bool) -> u128 {
+    compute_skew_extra_bps_units(ctx, is_buy, false)
+}
+
+/// `compute_skew_extra_bps` with the growth-v19 unit switch. `v3_units` is true ONLY when the
+/// call carries an ACTIVE ext-v3 inventory cap (security review L-1: the unit fix is opt-in,
+/// every legacy / v1 / v2 call keeps the deployed formula byte for byte).
+fn compute_skew_extra_bps_units(ctx: &MatcherCtx, is_buy: bool, v3_units: bool) -> u128 {
     if ctx.skew_spread_mult_bps == 0 {
         return 0;
     }
@@ -1331,21 +1376,23 @@ fn compute_skew_extra_bps(ctx: &MatcherCtx, is_buy: bool) -> u128 {
 
     let inv_abs = inv.unsigned_abs();
     let mult = ctx.skew_spread_mult_bps as u128;
-    // growth-v19 (GAP B.2.3) unit fix: with a real inventory cap, `skew_spread_mult_bps` is
-    // bps PER 100% OF THE CAP: `extra = mult * |inv| / max_inventory_abs`. The legacy form
-    // `mult * |inv| / 10_000` treats raw engine Q (1e6 per unit) as the unit and saturates the
-    // 5000 bps cap at once on memecoin sizes. A context with NO cap reference (0 = unlimited,
-    // or a sentinel above the engine's MAX_POSITION_ABS_Q such as i128::MAX) keeps the legacy
-    // formula byte for byte. Under ext v3 `ctx` here is the effective (min'd) context.
-    // Kind 1 (vAMM) only: the passive kind-0 matcher keeps its deployed pricing byte for byte.
+    // growth-v19 (GAP B.2.3) unit fix, OPT-IN (security review L-1): on a call carrying an
+    // ACTIVE ext-v3 cap, `skew_spread_mult_bps` is bps PER 100% OF THE CAP:
+    // `extra = mult * |inv| / max_inventory_abs` (`ctx` is then the effective, min'd context).
+    // The legacy form `mult * |inv| / 10_000` treats raw engine Q (1e6 per unit) as the unit and
+    // saturates the 5000 bps cap at once on memecoin sizes, but every legacy / v1 / v2 call
+    // keeps it byte for byte (the one live kind-1 context with skew, HqLMqhtM..., is unchanged
+    // by the matcher deploy). Kind 1 (vAMM) only.
     let kind1 = ctx.kind == MatcherKind::Vamm as u8;
-    let extra =
-        if kind1 && ctx.max_inventory_abs != 0 && ctx.max_inventory_abs <= SKEW_REF_MAX_INVENTORY_Q
-        {
-            inv_abs.saturating_mul(mult) / ctx.max_inventory_abs
-        } else {
-            inv_abs.saturating_mul(mult) / 10_000
-        };
+    let extra = if v3_units
+        && kind1
+        && ctx.max_inventory_abs != 0
+        && ctx.max_inventory_abs <= SKEW_REF_MAX_INVENTORY_Q
+    {
+        inv_abs.saturating_mul(mult) / ctx.max_inventory_abs
+    } else {
+        inv_abs.saturating_mul(mult) / 10_000
+    };
     // Saturate to avoid unbounded growth — cap at 5000 bps extra (50%)
     core::cmp::min(extra, 5000)
 }
@@ -1415,6 +1462,7 @@ fn execution_flags(fill_abs: u128, req_abs: u128) -> u32 {
 fn compute_passive_execution(
     ctx: &MatcherCtx,
     call: &MatcherCall,
+    v3_units: bool,
 ) -> Result<(u64, i128, u32), ProgramError> {
     let req_abs = call.req_size.unsigned_abs();
     let is_buy = call.req_size > 0;
@@ -1438,7 +1486,7 @@ fn compute_passive_execution(
 
     let base = ctx.base_spread_bps as u128;
     let fee = ctx.trading_fee_bps as u128;
-    let skew_extra = compute_skew_extra_bps(ctx, is_buy);
+    let skew_extra = compute_skew_extra_bps_units(ctx, is_buy, v3_units);
     let max_total = ctx.max_total_bps as u128;
     let total_bps = core::cmp::min(max_total, base + fee + skew_extra);
 
@@ -1475,6 +1523,7 @@ fn compute_passive_execution(
 fn compute_vamm_execution(
     ctx: &MatcherCtx,
     call: &MatcherCall,
+    v3_units: bool,
 ) -> Result<(u64, i128, u32), ProgramError> {
     let req_abs = call.req_size.unsigned_abs();
     let is_buy = call.req_size > 0;
@@ -1517,7 +1566,7 @@ fn compute_vamm_execution(
 
     let base = ctx.base_spread_bps as u128;
     let fee = ctx.trading_fee_bps as u128;
-    let skew_extra = compute_skew_extra_bps(ctx, is_buy);
+    let skew_extra = compute_skew_extra_bps_units(ctx, is_buy, v3_units);
     let max_total = ctx.max_total_bps as u128;
     let max_impact = max_total
         .saturating_sub(base)
