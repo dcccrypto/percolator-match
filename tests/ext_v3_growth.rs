@@ -670,3 +670,77 @@ fn m1_taker_reducing_is_never_clipped_for_lp_capacity() {
         "v2: ctx cap still binds"
     );
 }
+
+/// Kani-extraction pins (security re-verification Q5): `v2::v3_apply_caps` (exempt => no clip),
+/// `v2::v3_close_exempt_fill` and `vamm::v3_effective_ctx` (neutral caps == v2 context).
+#[test]
+fn v3_extractions_exempt_means_no_clip_and_neutral_is_v2() {
+    // finite cap: clipped unless exempt
+    let c = v2::v3_apply_caps(1_000, 500, -900, 950, false, false);
+    assert_eq!(
+        (c.max_inventory_abs, c.max_fill_abs, c.skew_ref_cap),
+        (950, 500, Some(950))
+    );
+    let e = v2::v3_apply_caps(1_000, 500, -900, 950, false, true);
+    assert_eq!(
+        (e.max_inventory_abs, e.max_fill_abs, e.skew_ref_cap),
+        (1_000, 500, Some(950))
+    );
+    // closed: a growing request gets room 0 unless exempt
+    let c = v2::v3_apply_caps(1_000, 500, -900, 0, true, false);
+    assert_eq!((c.max_fill_abs, c.skew_ref_cap), (0, None));
+    let e = v2::v3_apply_caps(1_000, 500, -900, 0, true, true);
+    assert_eq!((e.max_inventory_abs, e.max_fill_abs), (1_000, 500));
+    // exhaustive "exempt => limits unchanged" on a small domain
+    for inv in -3i128..=3 {
+        for cap in 0u128..=4 {
+            for (mi, mf) in [(0u128, 0u128), (2, 3), (5, 1)] {
+                for buy in [false, true] {
+                    let x = v2::v3_apply_caps(mi, mf, inv, cap, buy, true);
+                    assert_eq!((x.max_inventory_abs, x.max_fill_abs), (mi, mf));
+                }
+            }
+        }
+    }
+    // kind-2 exempt fill: full size at the clamp price; otherwise the quote stands
+    assert_eq!(v2::v3_close_exempt_fill(true, 10, 101, 40, 109), (40, 109));
+    assert_eq!(v2::v3_close_exempt_fill(false, 10, 101, 40, 109), (10, 101));
+    assert_eq!(v2::v3_close_exempt_fill(true, 40, 101, 40, 109), (40, 101));
+    // R3: neutral caps (>= 1e14, liq u128::MAX) leave the v2 effective context unchanged
+    let base = ctx_kind2(-500, 0);
+    let mut ext = base_ext();
+    ext.headroom_q = Some(777);
+    let v2e = vamm::v3_effective_ctx(&base, &ext, None, true, 0);
+    let neutral = ExtCapsV3 {
+        inventory_cap_q: u128::MAX,
+        liquidity_notional_e6: u128::MAX,
+    };
+    let v3e = vamm::v3_effective_ctx(&base, &ext, Some(neutral), true, 0);
+    assert!(!v3e.cap_active && !v3e.close_exempt && v3e.skew_ref_cap.is_none());
+    assert_eq!(
+        (
+            v3e.ctx.max_inventory_abs,
+            v3e.ctx.max_fill_abs,
+            v3e.ctx.liquidity_notional_e6,
+            v3e.ctx.max_total_bps
+        ),
+        (
+            v2e.ctx.max_inventory_abs,
+            v2e.ctx.max_fill_abs,
+            v2e.ctx.liquidity_notional_e6,
+            v2e.ctx.max_total_bps
+        )
+    );
+    // an exempt leg under an active closed cap keeps the v2 limits too
+    ext.taker_reducing = true;
+    let closed = ExtCapsV3 {
+        inventory_cap_q: 0,
+        liquidity_notional_e6: 0,
+    };
+    let x = vamm::v3_effective_ctx(&base, &ext, Some(closed), true, 0);
+    assert!(x.cap_active && x.close_exempt);
+    assert_eq!(
+        (x.ctx.max_inventory_abs, x.ctx.max_fill_abs),
+        (v2e.ctx.max_inventory_abs, v2e.ctx.max_fill_abs)
+    );
+}

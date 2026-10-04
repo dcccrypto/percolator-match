@@ -846,6 +846,70 @@ pub fn execute_leg(
     execute_leg_caps(ctx, call, ext, None, now_slot, headroom_used)
 }
 
+/// The effective context of one leg (`v3_effective_ctx`).
+#[derive(Clone, Copy, Debug)]
+pub struct V3Effective {
+    pub ctx: MatcherCtx,
+    /// The kind-2 skew reference cap under an active finite v3 cap.
+    pub skew_ref_cap: Option<u128>,
+    /// L-5: an ext cap `< SKEW_REF_MAX_INVENTORY_Q` is a real cap; at/above it (the wrapper's
+    /// neutral value for non-growth legs of a mixed batch) the leg prices exactly as v2.
+    pub cap_active: bool,
+    /// M-1: caps present and the wrapper verified the taker only reduces.
+    pub close_exempt: bool,
+}
+
+/// Kani extraction (R3 neutral caps, R1(2) exemption): the leg's effective limits before the
+/// stale-mark clip -- the exec band (`max_total_bps`), the wrapper headroom (`max_fill_abs`),
+/// the ext-v3 inventory cap / closed mode (`v2::v3_apply_caps`) and the v3 depth. With
+/// `caps == None` only the band and headroom apply (v0/v1/v2 behaviour).
+pub fn v3_effective_ctx(
+    ctx: &MatcherCtx,
+    ext: &CallExt,
+    caps: Option<v2::ExtCapsV3>,
+    is_buy: bool,
+    headroom_used: u128,
+) -> V3Effective {
+    let mut eff = *ctx;
+    if let Some(band) = ext.exec_band_bps {
+        // Price inside the wrapper's exec band (P1): kinds 0/1 clamp their spread at
+        // max_total; kind 2 clips size to stay within it.
+        eff.max_total_bps = eff.max_total_bps.min(band as u32);
+    }
+    if let Some(h) = ext.headroom_q {
+        let rem = (h as u128).saturating_sub(headroom_used);
+        if eff.max_fill_abs > rem {
+            eff.max_fill_abs = rem;
+        }
+    }
+    let cap_active = caps.is_some_and(|c| c.inventory_cap_q < SKEW_REF_MAX_INVENTORY_Q);
+    let close_exempt = caps.is_some() && ext.taker_reducing;
+    let mut skew_ref_cap: Option<u128> = None;
+    if let Some(c) = caps {
+        if cap_active {
+            let clip = v2::v3_apply_caps(
+                eff.max_inventory_abs,
+                eff.max_fill_abs,
+                ctx.inventory_base,
+                c.inventory_cap_q,
+                is_buy,
+                close_exempt,
+            );
+            eff.max_inventory_abs = clip.max_inventory_abs;
+            eff.max_fill_abs = clip.max_fill_abs;
+            skew_ref_cap = clip.skew_ref_cap;
+        }
+        eff.liquidity_notional_e6 =
+            v2::v3_effective_liquidity(eff.liquidity_notional_e6, c.liquidity_notional_e6);
+    }
+    V3Effective {
+        ctx: eff,
+        skew_ref_cap,
+        cap_active,
+        close_exempt,
+    }
+}
+
 /// [`execute_leg`] with the growth-v19 ext-v3 caps (`None` for a v0/v1/v2 call: identical to
 /// `execute_leg`). With caps the leg's effective inventory cap is
 /// `v2::v3_effective_max_inventory(ctx, ext)` (0 = CLOSED: only fills that reduce the LP's
@@ -871,56 +935,15 @@ pub fn execute_leg_caps(
         });
     }
 
-    // Effective limits for this leg (headroom and stale-reducing clips go here, so the
-    // unmodified v1 pricing functions see them as an ordinary max_fill_abs).
-    let mut eff = *ctx;
-    if let Some(band) = ext.exec_band_bps {
-        // Price inside the wrapper's exec band (P1): kinds 0/1 clamp their spread at
-        // max_total; kind 2 clips size to stay within it.
-        eff.max_total_bps = eff.max_total_bps.min(band as u32);
-    }
-    if let Some(h) = ext.headroom_q {
-        let rem = (h as u128).saturating_sub(headroom_used);
-        if eff.max_fill_abs > rem {
-            eff.max_fill_abs = rem;
-        }
-    }
-
     let is_buy = call.req_size > 0;
-    // growth-v19 ext v3: capital-derived caps, never looser than the context.
-    let mut skew_ref_cap: Option<u128> = None;
-    // L-5: an ext cap >= SKEW_REF_MAX_INVENTORY_Q (the engine's position bound; the wrapper's
-    // neutral value for non-growth legs of a mixed batch) is "no ext cap": no clip, no unit
-    // change -- the leg prices exactly as it would alone.
-    let cap_active = caps.is_some_and(|c| c.inventory_cap_q < SKEW_REF_MAX_INVENTORY_Q);
-    // M-1 (security review): a wrapper-verified taker REDUCTION is never clipped for LP
-    // capacity -- not by the v3 cap, not by the closed mode, not by the kind-2 size budget.
-    let close_exempt = caps.is_some() && ext.taker_reducing;
-    if let Some(c) = caps {
-        if cap_active {
-            match v2::v3_effective_max_inventory(eff.max_inventory_abs, c.inventory_cap_q) {
-                Some(m) => {
-                    if !close_exempt {
-                        eff.max_inventory_abs = m;
-                    }
-                    skew_ref_cap = Some(m);
-                }
-                None => {
-                    // CLOSED: only a fill that reduces the LP's |inventory| (buy from user =>
-                    // LP sells => inventory decreases), and only up to flat -- unless the
-                    // wrapper verified the TAKER only reduces (M-1).
-                    if !close_exempt {
-                        let room = v2::v3_closed_room(ctx.inventory_base, is_buy);
-                        if eff.max_fill_abs > room {
-                            eff.max_fill_abs = room;
-                        }
-                    }
-                }
-            }
-        }
-        eff.liquidity_notional_e6 =
-            v2::v3_effective_liquidity(eff.liquidity_notional_e6, c.liquidity_notional_e6);
-    }
+    // Effective limits for this leg (band, headroom, growth-v19 ext-v3 caps): the pure
+    // `v3_effective_ctx` (Kani extraction). The stale-reducing clip below then applies to it.
+    let V3Effective {
+        ctx: mut eff,
+        skew_ref_cap,
+        cap_active,
+        close_exempt,
+    } = v3_effective_ctx(ctx, ext, caps, is_buy, headroom_used);
     if let Some(b) = block.as_mut() {
         let now = now_slot.ok_or(ProgramError::UnsupportedSysvar)?;
         let needs_bind = kind == MatcherKind::Adaptive || b.cfg.observed_stale_slots > 0;
@@ -1046,7 +1069,7 @@ fn compute_adaptive_execution(
         let clamp = (eff.max_total_bps as u128).min(9_000);
         let p = v2::price_with_total_bps(call.oracle_price_e6, clamp, is_buy)
             .ok_or(ProgramError::ArithmeticOverflow)?;
-        (fill_abs, p)
+        v2::v3_close_exempt_fill(close_exempt, fill, price, fill_abs, p)
     } else {
         (fill, price)
     };

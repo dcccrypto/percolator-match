@@ -151,6 +151,67 @@ pub fn v3_closed_room(inventory_base: i128, is_buy: bool) -> u128 {
     }
 }
 
+/// The result of applying an ACTIVE ext-v3 cap to one leg (`v3_apply_caps`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V3Clip {
+    pub max_inventory_abs: u128,
+    pub max_fill_abs: u128,
+    /// The kind-2 skew reference cap (`None` in closed mode).
+    pub skew_ref_cap: Option<u128>,
+}
+
+/// Kani extraction ("exempt => no clip", R1(2) / R8): apply an ACTIVE ext-v3 inventory cap to
+/// a leg's effective `(max_inventory_abs, max_fill_abs)`.
+/// * finite cap: `max_inventory_abs = v3_effective_max_inventory(ctx, cap)`;
+/// * CLOSED (`cap == 0`): `max_fill_abs <= v3_closed_room(inventory, is_buy)`;
+/// * `close_exempt` (a wrapper-verified taker reduction, M-1): NEITHER limit is applied --
+///   the returned limits equal the inputs. The skew reference is still the effective cap.
+pub fn v3_apply_caps(
+    max_inventory_abs: u128,
+    max_fill_abs: u128,
+    inventory_base: i128,
+    inventory_cap_q: u128,
+    is_buy: bool,
+    close_exempt: bool,
+) -> V3Clip {
+    match v3_effective_max_inventory(max_inventory_abs, inventory_cap_q) {
+        Some(m) => V3Clip {
+            max_inventory_abs: if close_exempt { max_inventory_abs } else { m },
+            max_fill_abs,
+            skew_ref_cap: Some(m),
+        },
+        None => {
+            let room = v3_closed_room(inventory_base, is_buy);
+            V3Clip {
+                max_inventory_abs,
+                max_fill_abs: if !close_exempt && max_fill_abs > room {
+                    room
+                } else {
+                    max_fill_abs
+                },
+                skew_ref_cap: None,
+            }
+        }
+    }
+}
+
+/// Kani extraction (R1(2), kind 2): a close-exempt leg is filled in FULL (`fill_abs`), priced
+/// at the clamp price when the quote's size budget would have clipped it; any other leg keeps
+/// the quote's `(fill, price)`.
+pub fn v3_close_exempt_fill(
+    close_exempt: bool,
+    quoted_fill: u128,
+    quoted_price: u64,
+    fill_abs: u128,
+    clamp_price: u64,
+) -> (u128, u64) {
+    if close_exempt && quoted_fill < fill_abs {
+        (fill_abs, clamp_price)
+    } else {
+        (quoted_fill, quoted_price)
+    }
+}
+
 /// The effective depth under ext v3: `min(ctx, ext)`, with ext 0 = keep the context value.
 pub fn v3_effective_liquidity(ctx_liquidity_e6: u128, ext_liquidity_e6: u128) -> u128 {
     if ext_liquidity_e6 == 0 || ctx_liquidity_e6 <= ext_liquidity_e6 {
