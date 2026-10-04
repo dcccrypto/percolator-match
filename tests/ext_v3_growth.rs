@@ -519,4 +519,15 @@ fn v3_effective_helpers() {
     assert_eq!(v2::v3_effective_liquidity(10, 0), 10);
     assert_eq!(v2::v3_effective_liquidity(10, 4), 4);
     assert_eq!(v2::v3_effective_liquidity(10, 40), 10);
+    // closed room: only an LP-reducing fill, up to flat
+    assert_eq!(
+        v2::v3_closed_room(500, true),
+        500,
+        "LP long, user buys: LP sells down"
+    );
+    assert_eq!(v2::v3_closed_room(500, false), 0);
+    assert_eq!(v2::v3_closed_room(-500, false), 500);
+    assert_eq!(v2::v3_closed_room(-500, true), 0);
+    assert_eq!(v2::v3_closed_room(0, true), 0);
+    assert_eq!(v2::v3_closed_room(i128::MIN + 1, false), i128::MAX as u128);
 }

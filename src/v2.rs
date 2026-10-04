@@ -139,6 +139,18 @@ pub fn v3_effective_max_inventory(ctx_max_inventory_abs: u128, ext_cap: u128) ->
     )
 }
 
+/// ext v3 CLOSED mode (`inventory_cap_q == 0`): the most a fill may take in this direction is
+/// the LP's `|inventory|` when the fill REDUCES it (buy from user => LP sells => inventory
+/// decreases), else 0. A fill clipped to this never grows `|inventory|` and never crosses zero.
+pub fn v3_closed_room(inventory_base: i128, is_buy: bool) -> u128 {
+    let lp_reduces = (is_buy && inventory_base > 0) || (!is_buy && inventory_base < 0);
+    if lp_reduces {
+        inventory_base.unsigned_abs()
+    } else {
+        0
+    }
+}
+
 /// The effective depth under ext v3: `min(ctx, ext)`, with ext 0 = keep the context value.
 pub fn v3_effective_liquidity(ctx_liquidity_e6: u128, ext_liquidity_e6: u128) -> u128 {
     if ext_liquidity_e6 == 0 || ctx_liquidity_e6 <= ext_liquidity_e6 {

@@ -898,9 +898,7 @@ pub fn execute_leg_caps(
             None => {
                 // CLOSED: only a fill that reduces the LP's |inventory| (buy from user => LP
                 // sells => inventory decreases), and only up to flat.
-                let inv = ctx.inventory_base;
-                let lp_reduces = (is_buy && inv > 0) || (!is_buy && inv < 0);
-                let room = if lp_reduces { inv.unsigned_abs() } else { 0 };
+                let room = v2::v3_closed_room(ctx.inventory_base, is_buy);
                 if eff.max_fill_abs > room {
                     eff.max_fill_abs = room;
                 }
