@@ -64,6 +64,28 @@ fn main() {
             "example_hex": hex(&ext.encode()),
             "batch_trailer": "tag 3 length 18 + 26*n + 24*n: one ext per leg after all legs",
         },
+        // Matcher-inventory-sync (v2) and growth-v19 (v3): additive fixtures for the SDK's
+        // ext v2 / v3 encoders (byte-identical to the wrapper's `encode_matcher_call_ext_v2`
+        // and `growth_v19::encode_ext_v3_from_v2`).
+        "call_ext_v2": {
+            "version": v2::CALL_EXT_VERSION_V2,
+            "len": v2::CALL_EXT_V2_LEN,
+            "tag0_call_len": percolator_match::MATCHER_CALL_V2_LEN,
+            "field_offsets": { "v1_block": 0, "lp_position_q_i128": 24 },
+            "example_hex": hex(&CallExt { lp_position_q: Some(-1_234_567), ..ext }.encode_v2()),
+        },
+        "call_ext_v3": {
+            "version": v2::CALL_EXT_VERSION_V3,
+            "len": v2::CALL_EXT_V3_LEN,
+            "tag0_call_len": percolator_match::MATCHER_CALL_V3_LEN,
+            "field_offsets": { "v1_block": 0, "lp_position_q_i128": 24,
+                               "inventory_cap_q_u128": 40, "liquidity_notional_e6_u128": 56 },
+            "semantics": "caps are min(ctx, ext); inventory_cap_q == 0 => CLOSED to LP growth (not unlimited); liquidity 0 => keep ctx depth; inventory_cap_q > i128::MAX => rejected",
+            "batch_trailer": "tag 3 length 18 + 26*n + 72*n: one v3 ext per leg, never mixed widths",
+            "example_hex": hex(&CallExt { lp_position_q: Some(-1_234_567), ..ext }.encode_v3(
+                &v2::ExtCapsV3 { inventory_cap_q: 25_000_000_000, liquidity_notional_e6: 1_746_000_000 },
+            )),
+        },
         "return_flags": {
             "REQUESTED_FEE_SHIFT": FLAG_REQUESTED_FEE_SHIFT,
             "REQUESTED_FEE_MASK": FLAG_REQUESTED_FEE_MASK,

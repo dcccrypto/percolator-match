@@ -104,6 +104,13 @@ impl Env {
         self.svm.get_account(key).unwrap().data
     }
 
+    /// Overwrite a context account's data (re-sync two instances between calls).
+    pub fn set_ctx_data(&mut self, key: &Pubkey, data: &[u8]) {
+        let mut a = self.svm.get_account(key).unwrap();
+        a.data = data.to_vec();
+        self.svm.set_account(*key, a).unwrap();
+    }
+
     pub fn ctx_struct(&self, key: &Pubkey) -> MatcherCtx {
         MatcherCtx::read_from(&self.ctx_data(key)[CTX_VAMM_OFFSET..]).unwrap()
     }

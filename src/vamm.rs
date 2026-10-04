@@ -687,7 +687,7 @@ pub fn process_call_with_clock(
     slot_source: fn() -> Result<u64, ProgramError>,
 ) -> ProgramResult {
     let call = MatcherCall::parse(instruction_data)?;
-    let ext = MatcherCall::parse_ext(instruction_data)?;
+    let (ext, caps) = MatcherCall::parse_ext_caps(instruction_data)?;
 
     if call.oracle_price_e6 == 0 {
         return Err(ProgramError::InvalidInstructionData);
@@ -741,7 +741,7 @@ pub fn process_call_with_clock(
     } else {
         None
     };
-    let out = execute_leg(&mut ctx, &call, &ext, now, 0)?;
+    let out = execute_leg_caps(&mut ctx, &call, &ext, caps, now, 0)?;
     apply_fill(&mut ctx, &out, call.oracle_price_e6)?;
 
     {
@@ -843,9 +843,25 @@ pub fn execute_leg(
     now_slot: Option<u64>,
     headroom_used: u128,
 ) -> Result<LegOut, ProgramError> {
+    execute_leg_caps(ctx, call, ext, None, now_slot, headroom_used)
+}
+
+/// [`execute_leg`] with the growth-v19 ext-v3 caps (`None` for a v0/v1/v2 call: identical to
+/// `execute_leg`). With caps the leg's effective inventory cap is
+/// `v2::v3_effective_max_inventory(ctx, ext)` (0 = CLOSED: only fills that reduce the LP's
+/// |inventory|, up to flat), the depth `v2::v3_effective_liquidity(ctx, ext)`, and the
+/// kind-2 skew reference the same effective cap.
+pub fn execute_leg_caps(
+    ctx: &mut MatcherCtx,
+    call: &MatcherCall,
+    ext: &CallExt,
+    caps: Option<v2::ExtCapsV3>,
+    now_slot: Option<u64>,
+    headroom_used: u128,
+) -> Result<LegOut, ProgramError> {
     let kind = ctx.get_kind()?;
     let mut block = ctx.v2_block();
-    if block.is_none() && ext.is_legacy() && kind != MatcherKind::Adaptive {
+    if block.is_none() && ext.is_legacy() && caps.is_none() && kind != MatcherKind::Adaptive {
         let (p, sz, fl) = compute_execution(ctx, call)?;
         return Ok(LegOut {
             exec_price_e6: p,
@@ -871,6 +887,28 @@ pub fn execute_leg(
     }
 
     let is_buy = call.req_size > 0;
+    // growth-v19 ext v3: capital-derived caps, never looser than the context.
+    let mut skew_ref_cap: Option<u128> = None;
+    if let Some(c) = caps {
+        match v2::v3_effective_max_inventory(eff.max_inventory_abs, c.inventory_cap_q) {
+            Some(m) => {
+                eff.max_inventory_abs = m;
+                skew_ref_cap = Some(m);
+            }
+            None => {
+                // CLOSED: only a fill that reduces the LP's |inventory| (buy from user => LP
+                // sells => inventory decreases), and only up to flat.
+                let inv = ctx.inventory_base;
+                let lp_reduces = (is_buy && inv > 0) || (!is_buy && inv < 0);
+                let room = if lp_reduces { inv.unsigned_abs() } else { 0 };
+                if eff.max_fill_abs > room {
+                    eff.max_fill_abs = room;
+                }
+            }
+        }
+        eff.liquidity_notional_e6 =
+            v2::v3_effective_liquidity(eff.liquidity_notional_e6, c.liquidity_notional_e6);
+    }
     if let Some(b) = block.as_mut() {
         let now = now_slot.ok_or(ProgramError::UnsupportedSysvar)?;
         let needs_bind = kind == MatcherKind::Adaptive || b.cfg.observed_stale_slots > 0;
@@ -925,7 +963,19 @@ pub fn execute_leg(
             let now = now_slot.ok_or(ProgramError::UnsupportedSysvar)?;
             v2::vol_update(&b.cfg, &mut b.st, call.oracle_price_e6, now);
             let fee = v2::adaptive_fee_bps(&b.cfg, &b.st);
-            compute_adaptive_execution(&eff, call, &b.cfg, fee)?
+            // ext v3: the skew reference is the same effective cap (never above the config's).
+            let mut cfg = b.cfg;
+            if let Some(m) = skew_ref_cap {
+                let m64 = if m > u64::MAX as u128 {
+                    u64::MAX
+                } else {
+                    m as u64
+                };
+                if m64 < cfg.skew_ref_inventory {
+                    cfg.skew_ref_inventory = m64;
+                }
+            }
+            compute_adaptive_execution(&eff, call, &cfg, fee)?
         }
     };
     if let Some(b) = block {
@@ -1029,6 +1079,8 @@ pub fn process_batch_call_with_clock(
         v2::CALL_EXT_LEN
     } else if instruction_data.len() == legs_end + n * v2::CALL_EXT_V2_LEN {
         v2::CALL_EXT_V2_LEN
+    } else if instruction_data.len() == legs_end + n * v2::CALL_EXT_V3_LEN {
+        v2::CALL_EXT_V3_LEN
     } else {
         return Err(ProgramError::InvalidInstructionData);
     };
@@ -1146,11 +1198,11 @@ pub fn process_batch_call_with_clock(
         if req_size == i128::MIN {
             return Err(ProgramError::InvalidInstructionData);
         }
-        let ext = if ext_len != 0 {
+        let (ext, caps) = if ext_len != 0 {
             let eb = legs_end + i * ext_len;
-            CallExt::parse_any(&instruction_data[eb..eb + ext_len])?
+            CallExt::parse_any_caps(&instruction_data[eb..eb + ext_len])?
         } else {
-            CallExt::default()
+            (CallExt::default(), None)
         };
         // Matcher-inventory-sync: every v2 leg carries the LP's PRE-BATCH real position on its
         // asset. Inventory for this leg = that position moved by the fills of the earlier legs
@@ -1180,7 +1232,7 @@ pub fn process_batch_call_with_clock(
             .iter()
             .position(|&(a, d, _)| a == asset_index && d == dir);
         let already = slot.map(|k| used[k].2).unwrap_or(0);
-        let out = execute_leg(&mut ctx, &call, &ext, now, already)?;
+        let out = execute_leg_caps(&mut ctx, &call, &ext, caps, now, already)?;
         // Use checked_sub (not saturating_sub) so any overflow aborts the batch
         // atomically before the ctx write below — no partial-fill state escapes.
         apply_fill(&mut ctx, &out, oracle_price_e6)?;
@@ -1281,10 +1333,29 @@ fn compute_skew_extra_bps(ctx: &MatcherCtx, is_buy: bool) -> u128 {
 
     let inv_abs = inv.unsigned_abs();
     let mult = ctx.skew_spread_mult_bps as u128;
+    // growth-v19 (GAP B.2.3) unit fix: with a real inventory cap, `skew_spread_mult_bps` is
+    // bps PER 100% OF THE CAP: `extra = mult * |inv| / max_inventory_abs`. The legacy form
+    // `mult * |inv| / 10_000` treats raw engine Q (1e6 per unit) as the unit and saturates the
+    // 5000 bps cap at once on memecoin sizes. A context with NO cap reference (0 = unlimited,
+    // or a sentinel above the engine's MAX_POSITION_ABS_Q such as i128::MAX) keeps the legacy
+    // formula byte for byte. Under ext v3 `ctx` here is the effective (min'd) context.
+    // Kind 1 (vAMM) only: the passive kind-0 matcher keeps its deployed pricing byte for byte.
+    let kind1 = ctx.kind == MatcherKind::Vamm as u8;
+    let extra =
+        if kind1 && ctx.max_inventory_abs != 0 && ctx.max_inventory_abs <= SKEW_REF_MAX_INVENTORY_Q
+        {
+            inv_abs.saturating_mul(mult) / ctx.max_inventory_abs
+        } else {
+            inv_abs.saturating_mul(mult) / 10_000
+        };
     // Saturate to avoid unbounded growth — cap at 5000 bps extra (50%)
-    let extra = inv_abs.saturating_mul(mult) / 10_000;
     core::cmp::min(extra, 5000)
 }
+
+/// Largest inventory cap that is a real skew reference: the engine's `MAX_POSITION_ABS_Q`
+/// (1e14). A context cap above it can never bind (no position can reach it) and is treated as
+/// "no reference" (legacy skew units). Mirror of `percolator::MAX_POSITION_ABS_Q`.
+pub const SKEW_REF_MAX_INVENTORY_Q: u128 = 100_000_000_000_000;
 
 /// Combined denominator for `compute_insurance_fee`'s single fused division:
 /// notional (1e6) * trading_fee_bps (1e4) * fee_to_insurance_bps (1e4) = 1e14.

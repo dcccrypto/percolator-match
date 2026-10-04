@@ -82,6 +82,65 @@ impl Rng {
     }
 }
 
+/// The "k1 finite + skew + insurance, tiny depth" config (parity before growth-v19), with the
+/// skew multiplier as a parameter.
+fn k1_finite_skew_config(skew_spread_mult_bps: u16) -> InitParams {
+    InitParams {
+        kind: 1,
+        trading_fee_bps: 25,
+        base_spread_bps: 15,
+        max_total_bps: 1_000,
+        impact_k_bps: 2_000,
+        liquidity_notional_e6: 1_000_000_000,
+        max_fill_abs: 700,
+        max_inventory_abs: 3_000,
+        fee_to_insurance_bps: 5_000,
+        skew_spread_mult_bps,
+        lp_account_id: LP_ACCOUNT_ID,
+    }
+}
+
+/// growth-v19 (GAP B.2.3): on a kind-1 context with a REAL inventory cap and a non-zero skew
+/// multiplier, the new program prices the skew as `mult * |inv| / max_inventory_abs` while
+/// 12bd671 used `mult * |inv| / 10_000`. The same 64-call sequence as the parity test must
+/// (a) diverge with the skew on (the carve-out above is not vacuous) and (b) agree byte for
+/// byte with the skew off (`v1_parity_tag0_sequence_all_configs`, so the skew term is the
+/// ONLY change). Every divergent return keeps the size and differs only in price.
+#[test]
+fn growth_v19_k1_finite_skew_diverges_only_by_skew() {
+    let p = k1_finite_skew_config(7);
+    let mut pr = Pair::new(0x3f, &p);
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ 4);
+    let mut price: u64 = 50_000_000;
+    let mut slot = 10u64;
+    let mut divergent = 0usize;
+    for i in 0..64u64 {
+        let step = rng.range(0, 400) as i64 - 200;
+        price = ((price as i64) * (10_000 + step) / 10_000).max(1) as u64;
+        let mag = rng.range(1, 2_500) as i128;
+        let size = if rng.next() & 1 == 0 { mag } else { -mag };
+        slot += rng.range(0, 50);
+        pr.warp(slot);
+        let data = Call::new(1000 + i, price, size).encode();
+        let r1 = pr.v1.send(&pr.lp, true, &pr.ctx, data.clone());
+        let r2 = pr.v2.send(&pr.lp, true, &pr.ctx, data);
+        assert_eq!(r1.is_ok(), r2.is_ok(), "call #{i}: outcome kind must not change");
+        if r1.is_err() {
+            continue;
+        }
+        let a = decode_return(&pr.v1.ctx_data(&pr.ctx)[..64]);
+        let b = decode_return(&pr.v2.ctx_data(&pr.ctx)[..64]);
+        assert_eq!(a.exec_size, b.exec_size, "call #{i}: the skew never changes the size");
+        if a.exec_price_e6 != b.exec_price_e6 {
+            divergent += 1;
+        }
+        // re-sync the second instance to the first so every call starts from the same state
+        let v1_ctx = pr.v1.ctx_data(&pr.ctx).to_vec();
+        pr.v2.set_ctx_data(&pr.ctx, &v1_ctx);
+    }
+    assert!(divergent > 0, "the skew-units change must be observable on this config");
+}
+
 fn configs() -> Vec<(&'static str, InitParams)> {
     let base = init_params(0);
     vec![
@@ -113,20 +172,12 @@ fn configs() -> Vec<(&'static str, InitParams)> {
             },
         ),
         (
-            "k1 finite + skew + insurance, tiny depth (impact clamps)",
-            InitParams {
-                kind: 1,
-                trading_fee_bps: 25,
-                base_spread_bps: 15,
-                max_total_bps: 1_000,
-                impact_k_bps: 2_000,
-                liquidity_notional_e6: 1_000_000_000,
-                max_fill_abs: 700,
-                max_inventory_abs: 3_000,
-                fee_to_insurance_bps: 5_000,
-                skew_spread_mult_bps: 7,
-                lp_account_id: LP_ACCOUNT_ID,
-            },
+            // growth-v19: the kind-1 skew UNITS changed on purpose (bps per 100% of a real
+            // inventory cap instead of per raw Q), so this config keeps byte-for-byte parity
+            // with the skew term zeroed and `growth_v19_k1_finite_skew_diverges_only_by_skew`
+            // pins the intended divergence with the skew on.
+            "k1 finite + insurance, tiny depth (impact clamps), skew 0",
+            k1_finite_skew_config(0),
         ),
         (
             "k1 max_fill 0 (always zero-fill)",

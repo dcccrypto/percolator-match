@@ -54,6 +54,15 @@ pub const CALL_EXT_VERSION_V1: u8 = 1;
 pub const CALL_EXT_VERSION_V2: u8 = 2;
 /// Length of a version-2 call extension (v1 block + i128 LP position).
 pub const CALL_EXT_V2_LEN: usize = 40;
+/// growth-v19 (2026-10-04): version 3 = the v2 block followed by the wrapper's capital-derived
+/// caps, `u128 inventory_cap_q` (bytes 40..56) and `u128 liquidity_notional_e6` (56..72). The
+/// wrapper computes both from the LP's conservative equity (`N_cap = lambda * C_m / P`), so the
+/// quote's inventory clip, the wrapper's headroom / LP cap and its leverage gate are one number.
+/// Semantics (`ExtCapsV3`): every cap is `min(ctx, ext)`, never looser than the context;
+/// `inventory_cap_q == 0` means CLOSED to LP growth (only LP-reducing fills), NOT unlimited.
+pub const CALL_EXT_VERSION_V3: u8 = 3;
+/// Length of a version-3 call extension.
+pub const CALL_EXT_V3_LEN: usize = 72;
 /// `lp_headroom_q` is present.
 pub const EXT_FLAG_HEADROOM: u8 = 1 << 0;
 /// `mark_slot` is present.
@@ -102,6 +111,41 @@ pub struct CallExt {
     /// v2 only: the LP's real signed engine position on this leg's asset before this call
     /// (before this batch, for tag 3). `None` for v0/v1 blocks.
     pub lp_position_q: Option<i128>,
+}
+
+/// growth-v19 ext-v3 caps (see `CALL_EXT_VERSION_V3`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExtCapsV3 {
+    /// Wrapper `N_cap_q`. 0 = CLOSED to LP-inventory growth.
+    pub inventory_cap_q: u128,
+    /// Wrapper `lambda * C_m` depth. 0 = no depth information (the context's own value is
+    /// kept, so an LP-reducing fill on a closed LP is not priced at the max-total clamp).
+    pub liquidity_notional_e6: u128,
+}
+
+/// The effective inventory cap under ext v3: `None` = CLOSED (ext cap 0); otherwise
+/// `min(ctx, ext)` where a context cap of 0 means unlimited (legacy). Never looser than the
+/// context, never unlimited when the wrapper sent a finite cap.
+pub fn v3_effective_max_inventory(ctx_max_inventory_abs: u128, ext_cap: u128) -> Option<u128> {
+    if ext_cap == 0 {
+        return None;
+    }
+    Some(
+        if ctx_max_inventory_abs == 0 || ext_cap < ctx_max_inventory_abs {
+            ext_cap
+        } else {
+            ctx_max_inventory_abs
+        },
+    )
+}
+
+/// The effective depth under ext v3: `min(ctx, ext)`, with ext 0 = keep the context value.
+pub fn v3_effective_liquidity(ctx_liquidity_e6: u128, ext_liquidity_e6: u128) -> u128 {
+    if ext_liquidity_e6 == 0 || ctx_liquidity_e6 <= ext_liquidity_e6 {
+        ctx_liquidity_e6
+    } else {
+        ext_liquidity_e6
+    }
 }
 
 impl CallExt {
@@ -166,6 +210,50 @@ impl CallExt {
         }
         ext.lp_position_q = Some(pos);
         Ok(ext)
+    }
+
+    /// Parse a 72-byte version-3 block: the first 40 bytes follow every v2 rule, then the
+    /// two capital-derived caps. `inventory_cap_q` must fit `i128` (the matcher compares it
+    /// against signed inventory); anything else fails closed.
+    pub fn parse_v3(b: &[u8]) -> Result<(Self, ExtCapsV3), ProgramError> {
+        if b.len() != CALL_EXT_V3_LEN || b[0] != CALL_EXT_VERSION_V3 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let mut v2 = [0u8; CALL_EXT_V2_LEN];
+        v2.copy_from_slice(&b[..CALL_EXT_V2_LEN]);
+        v2[0] = CALL_EXT_VERSION_V2;
+        let ext = Self::parse_v2(&v2)?;
+        let inventory_cap_q = u128::from_le_bytes(b[40..56].try_into().unwrap());
+        let liquidity_notional_e6 = u128::from_le_bytes(b[56..72].try_into().unwrap());
+        if inventory_cap_q > i128::MAX as u128 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Ok((
+            ext,
+            ExtCapsV3 {
+                inventory_cap_q,
+                liquidity_notional_e6,
+            },
+        ))
+    }
+
+    /// Parse a 24-byte (v0/v1), 40-byte (v2) or 72-byte (v3) block, by length. Any other
+    /// length, or a version byte that does not match the length, fails closed.
+    pub fn parse_any_caps(b: &[u8]) -> Result<(Self, Option<ExtCapsV3>), ProgramError> {
+        match b.len() {
+            CALL_EXT_V3_LEN => Self::parse_v3(b).map(|(e, c)| (e, Some(c))),
+            _ => Self::parse_any(b).map(|e| (e, None)),
+        }
+    }
+
+    /// Encode as a version-3 block. `lp_position_q` must be `Some`.
+    pub fn encode_v3(&self, caps: &ExtCapsV3) -> [u8; CALL_EXT_V3_LEN] {
+        let mut b = [0u8; CALL_EXT_V3_LEN];
+        b[..CALL_EXT_V2_LEN].copy_from_slice(&self.encode_v2());
+        b[0] = CALL_EXT_VERSION_V3;
+        b[40..56].copy_from_slice(&caps.inventory_cap_q.to_le_bytes());
+        b[56..72].copy_from_slice(&caps.liquidity_notional_e6.to_le_bytes());
+        b
     }
 
     /// Parse either a 24-byte (v0/v1) or a 40-byte (v2) block, by length.
