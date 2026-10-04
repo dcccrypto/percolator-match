@@ -4210,4 +4210,79 @@ mod proofs {
             "validate must reject max_fill_abs > i128::MAX"
         );
     }
+
+    // ── growth-v19 (design note §3, rev 3 R3/R4; run once 2026-10-04) ─────────────────────
+
+    /// R4: kind-1 units only under an active v3 cap: with `v3_units == false` the result is
+    /// the deployed b5b419d formula for every ctx; with v3 units on kind 1 and 0 < cap <= 1e14
+    /// it is <= 5000, monotone in |inv|, and |inv| == cap gives min(mult, 5000). u16 inv / cap.
+    #[kani::proof]
+    #[kani::solver(cadical)]
+    fn proof_kind1_skew_units_capped_and_monotone() {
+        let i1: u16 = kani::any();
+        let i2: u16 = kani::any();
+        let cap: u16 = kani::any();
+        let mult: u16 = kani::any();
+        let kind: u8 = kani::any();
+        kani::assume(i1 <= i2 && cap > 0 && mult > 0 && kind <= 2);
+        let mk = |i: u16| MatcherCtx {
+            kind,
+            inventory_base: -(i as i128),
+            skew_spread_mult_bps: mult,
+            max_inventory_abs: cap as u128,
+            ..MatcherCtx::default()
+        };
+        // legacy units: byte-identical to the deployed formula
+        let legacy = |i: u16| core::cmp::min((i as u128).saturating_mul(mult as u128) / 10_000, 5000);
+        assert_eq!(compute_skew_extra_bps_units(&mk(i1), true, false), if i1 == 0 { 0 } else { legacy(i1) });
+        let a = compute_skew_extra_bps_units(&mk(i1), true, true);
+        let b = compute_skew_extra_bps_units(&mk(i2), true, true);
+        assert!(a <= 5000 && b <= 5000 && a <= b);
+        if kind == MatcherKind::Vamm as u8 && i2 == cap {
+            assert_eq!(b, core::cmp::min(mult as u128, 5000));
+        }
+        if kind != MatcherKind::Vamm as u8 {
+            assert_eq!(a, if i1 == 0 { 0 } else { legacy(i1) });
+        }
+        kani::cover!(kind == MatcherKind::Vamm as u8 && i2 == cap && b == mult as u128, "|inv| == cap -> mult");
+        kani::cover!(kind == MatcherKind::Vamm as u8 && a < b, "monotone, strict");
+        kani::cover!(kind == 0 && i1 > 0, "kind 0 keeps the legacy formula");
+    }
+
+    /// R3: neutral ext-v3 caps (inventory cap >= 1e14, liquidity u128::MAX) on a non-reducing
+    /// leg give EXACTLY the v2 effective context (no clip, no unit change).
+    #[kani::proof]
+    fn proof_v3_neutral_caps_equal_v2() {
+        let ctx = MatcherCtx {
+            kind: kani::any(),
+            max_total_bps: kani::any(),
+            liquidity_notional_e6: kani::any(),
+            max_fill_abs: kani::any(),
+            inventory_base: kani::any(),
+            max_inventory_abs: kani::any(),
+            ..MatcherCtx::default()
+        };
+        kani::assume(ctx.inventory_base != i128::MIN);
+        let mut ext = v2::CallExt::default();
+        ext.exec_band_bps = if kani::any() { Some(kani::any()) } else { None };
+        ext.headroom_q = if kani::any() { Some(kani::any()) } else { None };
+        let used: u128 = kani::any();
+        let buy: bool = kani::any();
+        let cap: u128 = kani::any();
+        kani::assume(cap >= SKEW_REF_MAX_INVENTORY_Q);
+        let neutral = v2::ExtCapsV3 {
+            inventory_cap_q: cap,
+            liquidity_notional_e6: u128::MAX,
+        };
+        let a = v3_effective_ctx(&ctx, &ext, None, buy, used);
+        let b = v3_effective_ctx(&ctx, &ext, Some(neutral), buy, used);
+        assert!(!b.cap_active && !b.close_exempt && b.skew_ref_cap.is_none());
+        assert_eq!(a.ctx.max_inventory_abs, b.ctx.max_inventory_abs);
+        assert_eq!(a.ctx.max_fill_abs, b.ctx.max_fill_abs);
+        assert_eq!(a.ctx.max_total_bps, b.ctx.max_total_bps);
+        assert_eq!(a.ctx.liquidity_notional_e6, b.ctx.liquidity_notional_e6);
+        kani::cover!(ext.headroom_q.is_some() && b.ctx.max_fill_abs < ctx.max_fill_abs, "headroom clips both");
+        kani::cover!(cap == SKEW_REF_MAX_INVENTORY_Q, "threshold boundary is neutral");
+    }
 }
+
