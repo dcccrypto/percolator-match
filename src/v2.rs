@@ -802,8 +802,30 @@ pub fn vol_update(c: &V2Config, s: &mut V2State, price_e6: u64, now_slot: u64) {
 
 /// ceil(a / b), b > 0.
 #[inline]
+#[cfg_attr(kani, kani::requires(b > 0))]
+#[cfg_attr(kani, kani::ensures(|r: &u128| kani_spec::ceil_rel(a, b, *r)))]
 fn div_ceil(a: u128, b: u128) -> u128 {
     a / b + u128::from(!a.is_multiple_of(b))
+}
+
+/// Kani contracts (growth-v19 rev 6, security review A2): exact remainder-form relations.
+/// `cfg(kani)` only; the `.so` is unchanged by them.
+#[cfg(kani)]
+pub mod kani_spec {
+    /// `q == floor(p / d)`: `q*d + r == p ∧ r < d`.
+    pub fn floor_rel(p: u128, d: u128, q: u128) -> bool {
+        d > 0 && q.checked_mul(d).is_some_and(|qd| qd <= p && p - qd < d)
+    }
+    /// `q == ceil(p / d)`, without the possibly-overflowing `q*d`.
+    pub fn ceil_rel(p: u128, d: u128, q: u128) -> bool {
+        if d == 0 {
+            return false;
+        }
+        if q == 0 {
+            return p == 0;
+        }
+        (q - 1).checked_mul(d).is_some_and(|x| x < p && p - x <= d)
+    }
 }
 
 /// Constant-product-shaped impact in bps for a fill of `notional_e6` against virtual depth
@@ -1530,9 +1552,23 @@ mod proofs {
         kani::cover!(!ex && q < fa, "non-exempt keeps the clip");
     }
 
+    /// Contract proof of the ceil divider. Bounded domain (u8 widened); lift in the results file.
+    #[kani::proof_for_contract(div_ceil)]
+    #[kani::solver(cadical)]
+    fn proof_div_ceil_contract() {
+        let a = kani::any::<u8>() as u128;
+        let b = kani::any::<u8>() as u128;
+        kani::assume(b > 0);
+        let r = div_ceil(a, b);
+        kani::cover!(a % b != 0 && r > 0, "rounds up");
+        kani::cover!(a == 0, "zero");
+    }
+
     /// Depth reaches capacity: with D = DEPTH_MULT(4) * capacity notional, the CP impact at
-    /// full capacity is finite and <= ceil(k / 3). Bound: u16 capacity notional, k <= 9000.
+    /// full capacity is finite and <= ceil(k / 3). `div_ceil` by its proven contract. Bound:
+    /// u16 capacity notional, k <= 9000.
     #[kani::proof]
+    #[kani::stub_verified(div_ceil)]
     #[kani::solver(cadical)]
     fn proof_growth_depth_reaches_capacity() {
         let n: u16 = kani::any();
@@ -1541,8 +1577,12 @@ mod proofs {
         let d = 4 * n as u128;
         let r = cp_impact_bps(n as u128, d, k as u32);
         assert!(r.is_some());
-        assert!(r.unwrap() <= (k as u128).div_ceil(3));
+        // ceil(k*n / 3n) == ceil(k / 3): assert through the exact relation (no divider here)
+        let c: u128 = kani::any();
+        kani::assume(kani_spec::ceil_rel(k as u128, 3, c));
+        assert!(r.unwrap() <= c);
         kani::cover!(r == Some(17) && k == 50, "pinned k = 50 -> 17 bps");
+        kani::cover!(k == 0, "k 0 -> 0");
     }
 }
 
