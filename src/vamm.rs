@@ -77,7 +77,7 @@ pub const MATCHER_VERSION: u32 = 4; // Bumped from 3 for new fields
 /// --- NEW FIELDS (carved from reserved) ---
 /// 144     8     insurance_accrued_e6 (accumulated insurance fee, read-only for cranker)
 /// 152     2     fee_to_insurance_bps (portion of trading_fee routed to insurance)
-/// 154     2     skew_spread_mult_bps (extra spread multiplier per inventory unit, 0=disabled)
+/// 154     2     skew_spread_mult_bps (extra bps at max_inventory_abs, linear ramp, 0=disabled)
 /// 156     4     _new_pad
 /// 160     8     lp_account_id (numeric LP identifier, must match instruction data)
 /// 168     8     insurance_fee_remainder_e6 (fractional insurance fee carried across calls)
@@ -120,7 +120,9 @@ pub struct MatcherCtx {
     /// Portion of trading_fee_bps routed to insurance reserve (e.g. 500 = 5%)
     pub fee_to_insurance_bps: u16, // 2 bytes, offset 152
     /// Extra spread multiplier per inventory unit for skew-aware quoting
-    /// Applied as: extra_bps = |inventory| * skew_spread_mult_bps / 10_000
+    /// Kinds 0/1: extra bps charged when |inventory| reaches `max_inventory_abs`, ramping
+    /// linearly from 0 (`extra = mult * min(|inv|, max_inv) / max_inv`, capped at 5000; inert
+    /// when `max_inventory_abs == 0`).
     /// 0 = disabled (legacy behavior)
     pub skew_spread_mult_bps: u16, // 2 bytes, offset 154
     pub _new_pad: [u8; 4], // 4 bytes, offset 156
@@ -941,7 +943,7 @@ pub fn execute_leg_caps(
     let V3Effective {
         ctx: mut eff,
         skew_ref_cap,
-        cap_active,
+        cap_active: _,
         close_exempt,
     } = v3_effective_ctx(ctx, ext, caps, is_buy, headroom_used);
     if let Some(b) = block.as_mut() {
@@ -985,9 +987,9 @@ pub fn execute_leg_caps(
 
     let out = match kind {
         MatcherKind::Passive | MatcherKind::Vamm => {
-            // L-1: new skew units only under an ACTIVE v3 cap. A close-exempt (M-1) leg is sized
-            // and priced against the context's own cap (the v3 cap is not applied to it).
-            let (p, sz, fl) = compute_execution_units(&eff, call, cap_active && !close_exempt)?;
+            // The skew ramp is normalised to `eff.max_inventory_abs` (the v3 cap when active; a
+            // close-exempt leg is sized and priced against the context's own cap).
+            let (p, sz, fl) = compute_execution(&eff, call)?;
             LegOut {
                 exec_price_e6: p,
                 exec_size: sz,
@@ -1340,45 +1342,43 @@ pub fn process_batch_call_with_clock(
 // Execution Logic
 // =============================================================================
 
+/// Kinds 0/1 execution. The M-1 skew unit fix (`compute_skew_extra_bps`: `skew_spread_mult_bps`
+/// = extra bps at FULL inventory, normalised to `max_inventory_abs`) applies to EVERY kind 0/1
+/// call. v2.1 deploys under fresh program IDs, so the growth-v19 L-1 opt-in unit switch (which
+/// kept the legacy `|inv|*mult/10_000` form byte for byte for legacy / v1 / v2 calls) has no
+/// legacy callers left to protect and is removed.
 fn compute_execution(
     ctx: &MatcherCtx,
     call: &MatcherCall,
 ) -> Result<(u64, i128, u32), ProgramError> {
-    compute_execution_units(ctx, call, false)
-}
-
-/// `compute_execution` with the opt-in v3 skew units (L-1).
-fn compute_execution_units(
-    ctx: &MatcherCtx,
-    call: &MatcherCall,
-    v3_units: bool,
-) -> Result<(u64, i128, u32), ProgramError> {
     match ctx.get_kind()? {
-        MatcherKind::Passive => compute_passive_execution(ctx, call, v3_units),
-        MatcherKind::Vamm => compute_vamm_execution(ctx, call, v3_units),
+        MatcherKind::Passive => compute_passive_execution(ctx, call),
+        MatcherKind::Vamm => compute_vamm_execution(ctx, call),
         // Kind 2 is priced only through `execute_leg` (needs the v2 block + clock).
         MatcherKind::Adaptive => Err(ProgramError::InvalidAccountData),
     }
 }
 
-/// Compute skew-aware spread addition.
+/// Compute skew-aware spread addition (kinds 0/1).
 ///
 /// When LP has positive inventory (long) and trade would increase it (sell from user),
 /// or LP has negative inventory (short) and trade would worsen it (buy from user),
-/// add extra spread proportional to |inventory|.
+/// add extra spread proportional to the inventory's share of `max_inventory_abs` (M):
 ///
-/// extra_bps = |inventory| * skew_spread_mult_bps / 10_000
-/// Only applied to the side that worsens inventory.
-#[cfg(any(test, kani))]
+/// ```text
+/// extra_bps = min(5000, floor(skew_spread_mult_bps * min(|inventory|, M) / M))
+/// ```
+///
+/// i.e. `skew_spread_mult_bps` is the extra spread charged at FULL inventory. Priced on the
+/// PRE-trade inventory (as before). `M == 0` ("unlimited", v3-compat) has no reference
+/// inventory, so the skew is inert (0). Only applied to the side that worsens inventory.
+///
+/// Live M-1 (2026-10-01): the previous `|inventory| * mult / 10_000` read engine quantity
+/// units (POS_SCALE) as if they were whole units, so ANY realistic inventory saturated the
+/// 5000 cap and every inventory-worsening fill was priced at `max_total_bps` (+200 bps on the
+/// relaunch markets) with the vAMM impact squeezed to zero.
 fn compute_skew_extra_bps(ctx: &MatcherCtx, is_buy: bool) -> u128 {
-    compute_skew_extra_bps_units(ctx, is_buy, false)
-}
-
-/// `compute_skew_extra_bps` with the growth-v19 unit switch. `v3_units` is true ONLY when the
-/// call carries an ACTIVE ext-v3 inventory cap (security review L-1: the unit fix is opt-in,
-/// every legacy / v1 / v2 call keeps the deployed formula byte for byte).
-fn compute_skew_extra_bps_units(ctx: &MatcherCtx, is_buy: bool, v3_units: bool) -> u128 {
-    if ctx.skew_spread_mult_bps == 0 {
+    if ctx.skew_spread_mult_bps == 0 || ctx.max_inventory_abs == 0 {
         return 0;
     }
 
@@ -1397,25 +1397,10 @@ fn compute_skew_extra_bps_units(ctx: &MatcherCtx, is_buy: bool, v3_units: bool) 
         return 0;
     }
 
-    let inv_abs = inv.unsigned_abs();
+    let m = ctx.max_inventory_abs;
     let mult = ctx.skew_spread_mult_bps as u128;
-    // growth-v19 (GAP B.2.3) unit fix, OPT-IN (security review L-1): on a call carrying an
-    // ACTIVE ext-v3 cap, `skew_spread_mult_bps` is bps PER 100% OF THE CAP:
-    // `extra = mult * |inv| / max_inventory_abs` (`ctx` is then the effective, min'd context).
-    // The legacy form `mult * |inv| / 10_000` treats raw engine Q (1e6 per unit) as the unit and
-    // saturates the 5000 bps cap at once on memecoin sizes, but every legacy / v1 / v2 call
-    // keeps it byte for byte (the one live kind-1 context with skew, HqLMqhtM..., is unchanged
-    // by the matcher deploy). Kind 1 (vAMM) only.
-    let kind1 = ctx.kind == MatcherKind::Vamm as u8;
-    let extra = if v3_units
-        && kind1
-        && ctx.max_inventory_abs != 0
-        && ctx.max_inventory_abs <= SKEW_REF_MAX_INVENTORY_Q
-    {
-        inv_abs.saturating_mul(mult) / ctx.max_inventory_abs
-    } else {
-        inv_abs.saturating_mul(mult) / 10_000
-    };
+    let x = core::cmp::min(inv.unsigned_abs(), m);
+    let extra = skew_ramp_bps(x, m, mult);
     // Saturate to avoid unbounded growth — cap at 5000 bps extra (50%)
     core::cmp::min(extra, 5000)
 }
@@ -1424,6 +1409,28 @@ fn compute_skew_extra_bps_units(ctx: &MatcherCtx, is_buy: bool, v3_units: bool) 
 /// (1e14). A context cap above it can never bind (no position can reach it) and is treated as
 /// "no reference" (legacy skew units). Mirror of `percolator::MAX_POSITION_ABS_Q`.
 pub const SKEW_REF_MAX_INVENTORY_Q: u128 = 100_000_000_000_000;
+
+/// `floor(mult * x / m)` for `x <= m`, `m > 0`, `mult <= 10_000`, without overflow.
+/// Exact while `m <= u128::MAX / 10_000`. Above that (e.g. the `i128::MAX` "unbounded"
+/// sentinel that init/configure clamp to) both `x` and `m` are shifted right by the same
+/// amount first: still `<= mult`, still monotone in `x`, and `x == m` still yields `mult`,
+/// but it may differ from the exact floor by one bps.
+fn skew_ramp_bps(x: u128, m: u128, mult: u128) -> u128 {
+    const EXACT_MAX: u128 = u128::MAX / 10_000;
+    if m <= EXACT_MAX {
+        return x * mult / m;
+    }
+    // Smallest shift s with (m >> s) <= EXACT_MAX. EXACT_MAX has 13 leading zeros
+    // (2^114 <= u128::MAX / 10_000 < 2^115, bit length 115), so s = (115 - (128 - lz(m))) or that + 1.
+    let bits = 128 - m.leading_zeros(); // >= 115 here
+    let mut s = bits.saturating_sub(115);
+    if (m >> s) > EXACT_MAX {
+        s += 1;
+    }
+    let m_s = m >> s; // >= 1: m > EXACT_MAX >= 2^114, s <= 14
+    let x_s = x >> s; // <= m_s
+    x_s * mult / m_s
+}
 
 /// Combined denominator for `compute_insurance_fee`'s single fused division:
 /// notional (1e6) * trading_fee_bps (1e4) * fee_to_insurance_bps (1e4) = 1e14.
@@ -1485,7 +1492,6 @@ fn execution_flags(fill_abs: u128, req_abs: u128) -> u32 {
 fn compute_passive_execution(
     ctx: &MatcherCtx,
     call: &MatcherCall,
-    v3_units: bool,
 ) -> Result<(u64, i128, u32), ProgramError> {
     let req_abs = call.req_size.unsigned_abs();
     let is_buy = call.req_size > 0;
@@ -1509,7 +1515,7 @@ fn compute_passive_execution(
 
     let base = ctx.base_spread_bps as u128;
     let fee = ctx.trading_fee_bps as u128;
-    let skew_extra = compute_skew_extra_bps_units(ctx, is_buy, v3_units);
+    let skew_extra = compute_skew_extra_bps(ctx, is_buy);
     let max_total = ctx.max_total_bps as u128;
     let total_bps = core::cmp::min(max_total, base + fee + skew_extra);
 
@@ -1546,7 +1552,6 @@ fn compute_passive_execution(
 fn compute_vamm_execution(
     ctx: &MatcherCtx,
     call: &MatcherCall,
-    v3_units: bool,
 ) -> Result<(u64, i128, u32), ProgramError> {
     let req_abs = call.req_size.unsigned_abs();
     let is_buy = call.req_size > 0;
@@ -1589,7 +1594,7 @@ fn compute_vamm_execution(
 
     let base = ctx.base_spread_bps as u128;
     let fee = ctx.trading_fee_bps as u128;
-    let skew_extra = compute_skew_extra_bps_units(ctx, is_buy, v3_units);
+    let skew_extra = compute_skew_extra_bps(ctx, is_buy);
     let max_total = ctx.max_total_bps as u128;
     let max_impact = max_total
         .saturating_sub(base)
@@ -2526,7 +2531,8 @@ mod tests {
     fn test_skew_widens_spread_when_worsening_inventory() {
         // LP is long (inv=1000), user sells (would make LP more long) → extra spread
         let mut ctx = default_passive_ctx();
-        ctx.skew_spread_mult_bps = 100; // 1% per unit
+        ctx.skew_spread_mult_bps = 100; // 1% at max inventory
+        ctx.max_inventory_abs = 10_000;
         ctx.inventory_base = 1000;
 
         let call_sell = make_call(100_000_000, -100);
@@ -2566,12 +2572,132 @@ mod tests {
     #[test]
     fn test_skew_extra_capped_at_5000_bps() {
         let mut ctx = default_passive_ctx();
-        ctx.skew_spread_mult_bps = 10_000; // 100% per unit
-        ctx.inventory_base = 100_000; // huge inventory
+        ctx.skew_spread_mult_bps = 10_000; // 100% at max inventory
+        ctx.max_inventory_abs = 100_000;
+        ctx.inventory_base = 100_000; // at max inventory
         ctx.max_total_bps = 9000; // raise max to see cap effect
 
         let extra = compute_skew_extra_bps(&ctx, false); // sell worsens long
         assert_eq!(extra, 5000, "skew extra capped at 5000 bps");
+    }
+
+    // --- Live M-1 (2026-10-01): skew normalised to max_inventory_abs ---
+
+    /// The relaunch SI LP ctx (kind 1): fee 5, base 50, maxTotal 200, impactK 200,
+    /// liquidity 1e10, max_inventory 987_410_515_921, skew mult 1. Oracle 3622 (e6).
+    fn live_si_ctx() -> MatcherCtx {
+        MatcherCtx {
+            trading_fee_bps: 5,
+            base_spread_bps: 50,
+            max_total_bps: 200,
+            impact_k_bps: 200,
+            liquidity_notional_e6: 10_000_000_000,
+            max_fill_abs: 246_852_628_980,
+            max_inventory_abs: 987_410_515_921,
+            skew_spread_mult_bps: 1,
+            ..default_vamm_ctx()
+        }
+    }
+
+    /// The pre-fix formula, kept only as the negative control.
+    fn old_skew_extra_bps(ctx: &MatcherCtx, is_buy: bool) -> u128 {
+        let inv = ctx.inventory_base;
+        let worsens = if is_buy { inv < 0 } else { inv > 0 };
+        if ctx.skew_spread_mult_bps == 0 || !worsens {
+            return 0;
+        }
+        core::cmp::min(
+            inv.unsigned_abs()
+                .saturating_mul(ctx.skew_spread_mult_bps as u128)
+                / 10_000,
+            5000,
+        )
+    }
+
+    #[test]
+    fn regression_m1_second_small_fill_priced_near_base_plus_impact() {
+        // $1 at 3622e-6: q = 1e12 / 3622 = 276_090_557 (the live batch3 leg size).
+        let oracle = 3622u64;
+        let q: i128 = 276_090_557;
+        let mut ctx = live_si_ctx();
+        let (p0, s0, _) = compute_execution(&ctx, &make_call(oracle, q)).unwrap();
+        assert_eq!(
+            (p0, s0),
+            (3642, q),
+            "first leg: base + fee (+0 impact) = +55 bps, ceil"
+        );
+        ctx.inventory_base -= s0; // LP short after the first buy
+        let (p1, s1, _) = compute_execution(&ctx, &make_call(oracle, q)).unwrap();
+        assert_eq!(s1, q);
+        // Skew at |inv| = 2.76e8 of M = 9.87e11 is floor(1 * 2.76e8 / 9.87e11) = 0 bps.
+        assert_eq!(compute_skew_extra_bps(&ctx, true), 0);
+        assert_eq!(
+            p1, p0,
+            "second small fill priced at base + fee + impact, not max_total"
+        );
+        // Negative control: the pre-fix formula saturates the same leg to max_total (+200).
+        let old = old_skew_extra_bps(&ctx, true);
+        assert_eq!(old, 5000, "pre-fix: 2.76e8 * 1 / 1e4 saturates");
+        let old_total = core::cmp::min(ctx.max_total_bps as u128, 50 + 5 + old);
+        assert_eq!(old_total, 200);
+        let old_price = ((oracle as u128 * (10_000 + old_total)).div_ceil(10_000)) as u64;
+        assert_eq!(old_price, 3695, "pre-fix leg-1 price seen live (+202 bps)");
+    }
+
+    #[test]
+    fn skew_zero_when_max_inventory_unlimited() {
+        let mut ctx = live_si_ctx();
+        ctx.max_inventory_abs = 0;
+        ctx.skew_spread_mult_bps = 10_000;
+        ctx.inventory_base = -1_000_000_000_000;
+        assert_eq!(compute_skew_extra_bps(&ctx, true), 0);
+    }
+
+    #[test]
+    fn skew_full_at_and_beyond_max_inventory_and_half_at_half() {
+        let mut ctx = live_si_ctx();
+        ctx.skew_spread_mult_bps = 300;
+        ctx.inventory_base = -(ctx.max_inventory_abs as i128);
+        assert_eq!(
+            compute_skew_extra_bps(&ctx, true),
+            300,
+            "full mult at |inv| = M"
+        );
+        ctx.inventory_base *= 2;
+        assert_eq!(compute_skew_extra_bps(&ctx, true), 300, "clamped beyond M");
+        ctx.inventory_base = -(ctx.max_inventory_abs as i128) / 2;
+        assert_eq!(
+            compute_skew_extra_bps(&ctx, true),
+            149,
+            "floor(300 * floor(M/2) / M)"
+        );
+        assert_eq!(
+            compute_skew_extra_bps(&ctx, false),
+            0,
+            "sell improves a short LP"
+        );
+    }
+
+    #[test]
+    fn skew_exact_branch_edge_and_unbounded_sentinel() {
+        const EXACT_MAX: u128 = u128::MAX / 10_000;
+        // Exact-branch edge: M = EXACT_MAX, x = M -> mult; x = M - 1 -> mult - 1.
+        assert_eq!(skew_ramp_bps(EXACT_MAX, EXACT_MAX, 10_000), 10_000);
+        assert_eq!(skew_ramp_bps(EXACT_MAX - 1, EXACT_MAX, 10_000), 9_999);
+        // Shift branch boundary (s = 1) and the i128::MAX "unbounded" sentinel.
+        for m in [EXACT_MAX + 1, i128::MAX as u128] {
+            for mult in [1u128, 5000, 10_000] {
+                assert_eq!(skew_ramp_bps(m, m, mult), mult, "x == M -> mult (m {m})");
+                assert!(skew_ramp_bps(m / 2, m, mult) <= mult);
+                assert_eq!(skew_ramp_bps(0, m, mult), 0);
+            }
+        }
+        // i128::MIN inventory against the sentinel M = i128::MAX: clamped, full mult.
+        let mut ctx = live_si_ctx();
+        ctx.max_inventory_abs = i128::MAX as u128;
+        ctx.skew_spread_mult_bps = 10_000;
+        ctx.inventory_base = i128::MIN;
+        assert_eq!(compute_skew_extra_bps(&ctx, true), 5000);
     }
 
     // --- NEW: Insurance fee tests ---
@@ -4040,27 +4166,251 @@ mod proofs {
         assert!(impact2 >= impact1, "larger fills must produce >= impact");
     }
 
-    /// Proof 8: skew extra spread capped at 5000 bps.
+    // ---- Live M-1 (2026-10-01): skew normalised to max_inventory_abs (design reviewed;
+    // scratchpad m-skew-kani-design.md). Proof 8 (`proof_skew_spread_capped_at_5000`) is
+    // REPLACED by K1/K1b: on `MatcherCtx::default()` (max_inventory_abs = 0) it would be vacuous.
+
+    const SKEW_EXACT_MAX: u128 = u128::MAX / 10_000;
+
+    fn skew_ctx(inv: i128, m: u128, mult: u16) -> MatcherCtx {
+        MatcherCtx {
+            inventory_base: inv,
+            max_inventory_abs: m,
+            skew_spread_mult_bps: mult,
+            ..MatcherCtx::default()
+        }
+    }
+
+    fn worsening(inv: i128, is_buy: bool) -> bool {
+        if is_buy {
+            inv < 0
+        } else {
+            inv > 0
+        }
+    }
+
+    /// K1: extra <= min(5000, mult) (exact branch, u64-bounded operands).
     #[kani::proof]
     #[kani::unwind(1)]
-    fn proof_skew_spread_capped_at_5000() {
+    fn proof_k1_skew_bounded_by_mult_and_cap() {
         let inv: i128 = kani::any();
-        let mult_bps: u16 = kani::any();
-        kani::assume(mult_bps > 0);
-
+        let m: u128 = kani::any();
+        let mult: u16 = kani::any();
         let is_buy: bool = kani::any();
+        kani::assume(inv.unsigned_abs() <= u64::MAX as u128);
+        kani::assume(m <= u64::MAX as u128);
+        kani::assume(mult <= 10_000);
+        let extra = compute_skew_extra_bps(&skew_ctx(inv, m, mult), is_buy);
+        assert!(extra <= core::cmp::min(5000, mult as u128));
+        kani::cover!(extra == mult as u128 && mult > 0);
+        kani::cover!(extra > 0 && extra < mult as u128);
+        kani::cover!(mult > 5000 && extra == 5000);
+    }
 
-        let ctx = MatcherCtx {
+    /// K1b: the shift branch (M above u128::MAX / 10_000, incl. the i128::MAX sentinel),
+    /// concrete mult (pre-agreed tractability split): bound and the x == M endpoint.
+    fn k1b(mult: u16) {
+        let inv: i128 = kani::any();
+        let m: u128 = kani::any();
+        let is_buy: bool = kani::any();
+        kani::assume(m > SKEW_EXACT_MAX && m <= i128::MAX as u128);
+        let extra = compute_skew_extra_bps(&skew_ctx(inv, m, mult), is_buy);
+        let cap = core::cmp::min(5000, mult as u128);
+        assert!(extra <= cap);
+        if worsening(inv, is_buy) && inv.unsigned_abs() >= m {
+            assert!(extra == cap, "x == M -> full mult");
+        }
+        kani::cover!(m == i128::MAX as u128 && inv == i128::MIN && is_buy && extra == cap);
+        kani::cover!(m == SKEW_EXACT_MAX + 1 && extra == cap);
+        if mult > 1 {
+            kani::cover!(extra > 0 && extra < cap);
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_k1b_skew_huge_m_mult_1() {
+        k1b(1);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_k1b_skew_huge_m_mult_5000() {
+        k1b(5000);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_k1b_skew_huge_m_mult_10000() {
+        k1b(10_000);
+    }
+
+    /// K2: mult == 0, M == 0 (unlimited -> inert) and non-worsening fills pay no skew.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_k2_skew_zero_cases() {
+        let inv: i128 = kani::any();
+        let m: u128 = kani::any();
+        let mult: u16 = kani::any();
+        let is_buy: bool = kani::any();
+        kani::assume(inv.unsigned_abs() <= u64::MAX as u128);
+        kani::assume(m <= u64::MAX as u128);
+        kani::assume(mult <= 10_000);
+        let w = worsening(inv, is_buy);
+        let extra = compute_skew_extra_bps(&skew_ctx(inv, m, mult), is_buy);
+        if mult == 0 || m == 0 || !w {
+            assert!(extra == 0);
+        }
+        kani::cover!(m == 0 && mult > 0 && w && inv != 0);
+        kani::cover!(mult == 0 && m > 0 && w);
+        kani::cover!(!w && mult > 0 && m > 0 && inv != 0);
+        kani::cover!(inv == 0);
+        kani::cover!(extra > 0 && is_buy);
+        kani::cover!(extra > 0 && !is_buy);
+    }
+
+    /// K3: monotone non-decreasing in |inv| on the worsening side (two calls, same ctx
+    /// otherwise). Bounds per review: M <= 2^32, |inv| <= 2^33.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_k3_skew_monotone_in_inventory() {
+        let a: u64 = kani::any();
+        let b: u64 = kani::any();
+        let m: u128 = kani::any();
+        let mult: u16 = kani::any();
+        let is_buy: bool = kani::any();
+        kani::assume(a <= b && b <= (1u64 << 33));
+        kani::assume(m <= (1u128 << 32));
+        kani::assume(mult <= 10_000);
+        let sign: i128 = if is_buy { -1 } else { 1 };
+        let e1 = compute_skew_extra_bps(&skew_ctx(sign * a as i128, m, mult), is_buy);
+        let e2 = compute_skew_extra_bps(&skew_ctx(sign * b as i128, m, mult), is_buy);
+        assert!(e1 <= e2);
+        kani::cover!(e1 < e2);
+    }
+
+    /// K4: normalisation — at or below half of max inventory, at most half of mult (floor).
+    /// The pre-fix |inv| * mult / 10_000 violates this for any |inv| > 20_000 with M large.
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_k4_skew_half_inventory_at_most_half_mult() {
+        let inv: i128 = kani::any();
+        let m: u128 = kani::any();
+        let mult: u16 = kani::any();
+        let is_buy: bool = kani::any();
+        kani::assume(inv.unsigned_abs() <= u64::MAX as u128);
+        kani::assume(m > 0 && m <= u64::MAX as u128);
+        kani::assume(mult <= 10_000);
+        kani::assume(inv.unsigned_abs() <= m / 2);
+        let extra = compute_skew_extra_bps(&skew_ctx(inv, m, mult), is_buy);
+        assert!(extra <= mult as u128 / 2);
+        kani::cover!(extra > 0);
+    }
+
+    /// K6: exactness in the exact branch below the cap — the defining floor relation
+    /// extra * M <= mult * x < (extra + 1) * M, x = min(|inv|, M).
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_k6_skew_is_exact_floor() {
+        let inv: i128 = kani::any();
+        let m: u128 = kani::any();
+        let mult: u16 = kani::any();
+        let is_buy: bool = kani::any();
+        kani::assume(inv.unsigned_abs() <= u64::MAX as u128);
+        kani::assume(m > 0 && m <= u64::MAX as u128);
+        kani::assume(mult > 0 && mult <= 10_000);
+        kani::assume(worsening(inv, is_buy));
+        let extra = compute_skew_extra_bps(&skew_ctx(inv, m, mult), is_buy);
+        let x = core::cmp::min(inv.unsigned_abs(), m);
+        if extra < 5000 {
+            let mx = mult as u128 * x;
+            assert!(extra * m <= mx);
+            assert!(mx < (extra + 1) * m);
+        }
+        kani::cover!(extra > 0 && extra < 5000);
+        kani::cover!(extra == 0 && x > 0);
+    }
+
+    /// K5: pricing — with |inv| <= M/100 and mult <= 100 the skewed quote is within 1 bps
+    /// of the unskewed quote (differential: the same real pricing function with mult = 0),
+    /// and the fill is unchanged. max_total is wide enough that the pre-fix saturation
+    /// (old formula) would breach it. Concrete M / oracle / liquidity (constant divisors).
+    fn k5_ctx(kind: MatcherKind, inv: i128, mult: u16) -> MatcherCtx {
+        MatcherCtx {
+            kind: kind as u8,
+            trading_fee_bps: 5,
+            base_spread_bps: 50,
+            max_total_bps: 9_000,
+            impact_k_bps: if matches!(kind, MatcherKind::Vamm) {
+                200
+            } else {
+                0
+            },
+            liquidity_notional_e6: 10_000_000_000,
+            max_fill_abs: u64::MAX as u128,
             inventory_base: inv,
-            skew_spread_mult_bps: mult_bps,
+            max_inventory_abs: 1_000_000_000,
+            skew_spread_mult_bps: mult,
             ..MatcherCtx::default()
-        };
+        }
+    }
 
-        let extra = compute_skew_extra_bps(&ctx, is_buy);
-        assert!(
-            extra <= 5000,
-            "skew extra spread must be capped at 5000 bps"
-        );
+    fn k5(kind: MatcherKind, is_buy: bool) {
+        const ORACLE: u64 = 1_000_000;
+        let fill: u32 = kani::any();
+        let inv_abs: u32 = kani::any();
+        let mult: u16 = kani::any();
+        kani::assume(fill > 0);
+        kani::assume(inv_abs <= 10_000_000); // M / 100
+        kani::assume(mult <= 100);
+        let inv: i128 = if is_buy {
+            -(inv_abs as i128)
+        } else {
+            inv_abs as i128
+        };
+        let req: i128 = if is_buy {
+            fill as i128
+        } else {
+            -(fill as i128)
+        };
+        let call = MatcherCall {
+            req_id: 1,
+            asset_index: 0,
+            lp_account_id: 0,
+            oracle_price_e6: ORACLE,
+            req_size: req,
+        };
+        let with = compute_execution(&k5_ctx(kind, inv, mult), &call);
+        let without = compute_execution(&k5_ctx(kind, inv, 0), &call);
+        let one_bps = ORACLE.div_ceil(10_000);
+        kani::cover!(with.is_ok());
+        if let (Ok((p1, s1, _)), Ok((p0, s0, _))) = (with, without) {
+            assert!(s1 == s0);
+            if is_buy {
+                assert!(p1 <= p0 + one_bps);
+            } else {
+                assert!(p1 + one_bps >= p0);
+            }
+            kani::cover!(p1 != p0);
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_k5_vamm_buy_skew_within_1bps_when_small_inventory() {
+        k5(MatcherKind::Vamm, true);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_k5_vamm_sell_skew_within_1bps_when_small_inventory() {
+        k5(MatcherKind::Vamm, false);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn proof_k5_passive_buy_skew_within_1bps_when_small_inventory() {
+        k5(MatcherKind::Passive, true);
     }
 
     /// Proof 9: passive spread never produces zero exec_price for valid oracle.
