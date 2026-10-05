@@ -116,3 +116,35 @@ fn compute_units_report() {
         assert!(*v <= LIMIT, "{k}: {v} CU exceeds {LIMIT}");
     }
 }
+
+/// M-1: kinds 0/1 with the skew term LIVE on the inventory-worsening side (the ramp divides by
+/// `max_inventory_abs`; the retired form divided by a constant). The second same-direction buy
+/// pays skew.
+#[test]
+fn compute_units_skew_worsening_report() {
+    let mut rows: Vec<(String, u64)> = vec![];
+    for (label, mut env) in [("v1", Env::v1()), ("v2", Env::v2())] {
+        let lp = seeded_keypair(1);
+        for kind in [0u8, 1] {
+            let mut p = init_params(kind);
+            p.max_inventory_abs = 1_000_000_000;
+            p.skew_spread_mult_bps = 200;
+            p.base_spread_bps = 20;
+            p.max_total_bps = 800;
+            if kind == 1 {
+                p.impact_k_bps = 5_000;
+                p.liquidity_notional_e6 = 10_000_000_000_000;
+            }
+            let ctx = env.new_ctx(&lp, &p);
+            env.call(&lp, &ctx, &Call::new(1, 1_000_000, 100_000_000)).unwrap();
+            let (r, m) = env.call(&lp, &ctx, &Call::new(2, 1_000_000, 100_000_000)).unwrap();
+            assert_ne!(r.exec_size, 0);
+            rows.push((format!("{label} tag0 skew-worsening kind {kind}"), m.compute_units_consumed));
+        }
+    }
+    println!("\n=== compute units (skew live) ===");
+    for (k, v) in &rows {
+        println!("{k:<40} {v:>8}");
+        assert!(*v > 0 && *v <= LIMIT, "{k}: {v}");
+    }
+}
