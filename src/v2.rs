@@ -54,6 +54,15 @@ pub const CALL_EXT_VERSION_V1: u8 = 1;
 pub const CALL_EXT_VERSION_V2: u8 = 2;
 /// Length of a version-2 call extension (v1 block + i128 LP position).
 pub const CALL_EXT_V2_LEN: usize = 40;
+/// growth-v19 (2026-10-04): version 3 = the v2 block followed by the wrapper's capital-derived
+/// caps, `u128 inventory_cap_q` (bytes 40..56) and `u128 liquidity_notional_e6` (56..72). The
+/// wrapper computes both from the LP's conservative equity (`N_cap = lambda * C_m / P`), so the
+/// quote's inventory clip, the wrapper's headroom / LP cap and its leverage gate are one number.
+/// Semantics (`ExtCapsV3`): every cap is `min(ctx, ext)`, never looser than the context;
+/// `inventory_cap_q == 0` means CLOSED to LP growth (only LP-reducing fills), NOT unlimited.
+pub const CALL_EXT_VERSION_V3: u8 = 3;
+/// Length of a version-3 call extension.
+pub const CALL_EXT_V3_LEN: usize = 72;
 /// `lp_headroom_q` is present.
 pub const EXT_FLAG_HEADROOM: u8 = 1 << 0;
 /// `mark_slot` is present.
@@ -102,6 +111,114 @@ pub struct CallExt {
     /// v2 only: the LP's real signed engine position on this leg's asset before this call
     /// (before this batch, for tag 3). `None` for v0/v1 blocks.
     pub lp_position_q: Option<i128>,
+}
+
+/// growth-v19 ext-v3 caps (see `CALL_EXT_VERSION_V3`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExtCapsV3 {
+    /// Wrapper `N_cap_q`. 0 = CLOSED to LP-inventory growth.
+    pub inventory_cap_q: u128,
+    /// Wrapper `lambda * C_m` depth. 0 = no depth information (the context's own value is
+    /// kept, so an LP-reducing fill on a closed LP is not priced at the max-total clamp).
+    pub liquidity_notional_e6: u128,
+}
+
+/// The effective inventory cap under ext v3: `None` = CLOSED (ext cap 0); otherwise
+/// `min(ctx, ext)` where a context cap of 0 means unlimited (legacy). Never looser than the
+/// context, never unlimited when the wrapper sent a finite cap.
+pub fn v3_effective_max_inventory(ctx_max_inventory_abs: u128, ext_cap: u128) -> Option<u128> {
+    if ext_cap == 0 {
+        return None;
+    }
+    Some(
+        if ctx_max_inventory_abs == 0 || ext_cap < ctx_max_inventory_abs {
+            ext_cap
+        } else {
+            ctx_max_inventory_abs
+        },
+    )
+}
+
+/// ext v3 CLOSED mode (`inventory_cap_q == 0`): the most a fill may take in this direction is
+/// the LP's `|inventory|` when the fill REDUCES it (buy from user => LP sells => inventory
+/// decreases), else 0. A fill clipped to this never grows `|inventory|` and never crosses zero.
+pub fn v3_closed_room(inventory_base: i128, is_buy: bool) -> u128 {
+    let lp_reduces = (is_buy && inventory_base > 0) || (!is_buy && inventory_base < 0);
+    if lp_reduces {
+        inventory_base.unsigned_abs()
+    } else {
+        0
+    }
+}
+
+/// The result of applying an ACTIVE ext-v3 cap to one leg (`v3_apply_caps`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V3Clip {
+    pub max_inventory_abs: u128,
+    pub max_fill_abs: u128,
+    /// The kind-2 skew reference cap (`None` in closed mode).
+    pub skew_ref_cap: Option<u128>,
+}
+
+/// Kani extraction ("exempt => no clip", R1(2) / R8): apply an ACTIVE ext-v3 inventory cap to
+/// a leg's effective `(max_inventory_abs, max_fill_abs)`.
+/// * finite cap: `max_inventory_abs = v3_effective_max_inventory(ctx, cap)`;
+/// * CLOSED (`cap == 0`): `max_fill_abs <= v3_closed_room(inventory, is_buy)`;
+/// * `close_exempt` (a wrapper-verified taker reduction, M-1): NEITHER limit is applied --
+///   the returned limits equal the inputs. The skew reference is still the effective cap.
+pub fn v3_apply_caps(
+    max_inventory_abs: u128,
+    max_fill_abs: u128,
+    inventory_base: i128,
+    inventory_cap_q: u128,
+    is_buy: bool,
+    close_exempt: bool,
+) -> V3Clip {
+    match v3_effective_max_inventory(max_inventory_abs, inventory_cap_q) {
+        Some(m) => V3Clip {
+            max_inventory_abs: if close_exempt { max_inventory_abs } else { m },
+            max_fill_abs,
+            skew_ref_cap: Some(m),
+        },
+        None => {
+            let room = v3_closed_room(inventory_base, is_buy);
+            V3Clip {
+                max_inventory_abs,
+                max_fill_abs: if !close_exempt && max_fill_abs > room {
+                    room
+                } else {
+                    max_fill_abs
+                },
+                skew_ref_cap: None,
+            }
+        }
+    }
+}
+
+/// Kani extraction (R1(2), kind 2): a close-exempt leg is filled in FULL (`fill_abs`), priced
+/// at the clamp price when the quote's size budget would have clipped it; any other leg keeps
+/// the quote's `(fill, price)`.
+pub fn v3_close_exempt_fill(
+    close_exempt: bool,
+    quoted_fill: u128,
+    quoted_price: u64,
+    fill_abs: u128,
+    clamp_price: u64,
+) -> (u128, u64) {
+    if close_exempt && quoted_fill < fill_abs {
+        (fill_abs, clamp_price)
+    } else {
+        (quoted_fill, quoted_price)
+    }
+}
+
+/// The effective depth under ext v3: `min(ctx, ext)`, with ext 0 = keep the context value.
+pub fn v3_effective_liquidity(ctx_liquidity_e6: u128, ext_liquidity_e6: u128) -> u128 {
+    if ext_liquidity_e6 == 0 || ctx_liquidity_e6 <= ext_liquidity_e6 {
+        ctx_liquidity_e6
+    } else {
+        ext_liquidity_e6
+    }
 }
 
 impl CallExt {
@@ -166,6 +283,50 @@ impl CallExt {
         }
         ext.lp_position_q = Some(pos);
         Ok(ext)
+    }
+
+    /// Parse a 72-byte version-3 block: the first 40 bytes follow every v2 rule, then the
+    /// two capital-derived caps. `inventory_cap_q` must fit `i128` (the matcher compares it
+    /// against signed inventory); anything else fails closed.
+    pub fn parse_v3(b: &[u8]) -> Result<(Self, ExtCapsV3), ProgramError> {
+        if b.len() != CALL_EXT_V3_LEN || b[0] != CALL_EXT_VERSION_V3 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        let mut v2 = [0u8; CALL_EXT_V2_LEN];
+        v2.copy_from_slice(&b[..CALL_EXT_V2_LEN]);
+        v2[0] = CALL_EXT_VERSION_V2;
+        let ext = Self::parse_v2(&v2)?;
+        let inventory_cap_q = u128::from_le_bytes(b[40..56].try_into().unwrap());
+        let liquidity_notional_e6 = u128::from_le_bytes(b[56..72].try_into().unwrap());
+        if inventory_cap_q > i128::MAX as u128 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        Ok((
+            ext,
+            ExtCapsV3 {
+                inventory_cap_q,
+                liquidity_notional_e6,
+            },
+        ))
+    }
+
+    /// Parse a 24-byte (v0/v1), 40-byte (v2) or 72-byte (v3) block, by length. Any other
+    /// length, or a version byte that does not match the length, fails closed.
+    pub fn parse_any_caps(b: &[u8]) -> Result<(Self, Option<ExtCapsV3>), ProgramError> {
+        match b.len() {
+            CALL_EXT_V3_LEN => Self::parse_v3(b).map(|(e, c)| (e, Some(c))),
+            _ => Self::parse_any(b).map(|e| (e, None)),
+        }
+    }
+
+    /// Encode as a version-3 block. `lp_position_q` must be `Some`.
+    pub fn encode_v3(&self, caps: &ExtCapsV3) -> [u8; CALL_EXT_V3_LEN] {
+        let mut b = [0u8; CALL_EXT_V3_LEN];
+        b[..CALL_EXT_V2_LEN].copy_from_slice(&self.encode_v2());
+        b[0] = CALL_EXT_VERSION_V3;
+        b[40..56].copy_from_slice(&caps.inventory_cap_q.to_le_bytes());
+        b[56..72].copy_from_slice(&caps.liquidity_notional_e6.to_le_bytes());
+        b
     }
 
     /// Parse either a 24-byte (v0/v1) or a 40-byte (v2) block, by length.
@@ -641,8 +802,30 @@ pub fn vol_update(c: &V2Config, s: &mut V2State, price_e6: u64, now_slot: u64) {
 
 /// ceil(a / b), b > 0.
 #[inline]
+#[cfg_attr(kani, kani::requires(b > 0))]
+#[cfg_attr(kani, kani::ensures(|r: &u128| kani_spec::ceil_rel(a, b, *r)))]
 fn div_ceil(a: u128, b: u128) -> u128 {
     a / b + u128::from(!a.is_multiple_of(b))
+}
+
+/// Kani contracts (growth-v19 rev 6, security review A2): exact remainder-form relations.
+/// `cfg(kani)` only; the `.so` is unchanged by them.
+#[cfg(kani)]
+pub mod kani_spec {
+    /// `q == floor(p / d)`: `q*d + r == p ∧ r < d`.
+    pub fn floor_rel(p: u128, d: u128, q: u128) -> bool {
+        d > 0 && q.checked_mul(d).is_some_and(|qd| qd <= p && p - qd < d)
+    }
+    /// `q == ceil(p / d)`, without the possibly-overflowing `q*d`.
+    pub fn ceil_rel(p: u128, d: u128, q: u128) -> bool {
+        if d == 0 {
+            return false;
+        }
+        if q == 0 {
+            return p == 0;
+        }
+        (q - 1).checked_mul(d).is_some_and(|x| x < p && p - x <= d)
+    }
 }
 
 /// Constant-product-shaped impact in bps for a fill of `notional_e6` against virtual depth
@@ -1258,4 +1441,148 @@ mod proofs {
         }
         kani::cover!(st == MarkState::Stale);
     }
+
+    // ── growth-v19 ext v3 (design note §3, rev 3 R1(2)/R14; run once 2026-10-04) ──────────
+
+    /// `ext == 0 ⇔ None`; `Some(m) ⇒ 0 < m <= ext ∧ (ctx == 0 ∨ m <= ctx)`. Full u128.
+    #[kani::proof]
+    fn proof_v3_effective_inventory_min_and_closed() {
+        let ctx: u128 = kani::any();
+        let ext: u128 = kani::any();
+        let r = v3_effective_max_inventory(ctx, ext);
+        assert_eq!(r.is_none(), ext == 0);
+        if let Some(m) = r {
+            assert!(m > 0 && m <= ext && (ctx == 0 || m <= ctx));
+        }
+        kani::cover!(ctx == 0 && r == Some(ext) && ext > 0, "legacy unlimited takes ext");
+        kani::cover!(ctx > 0 && ext > ctx && r == Some(ctx), "ctx binds");
+        kani::cover!(ctx > ext && ext > 0 && r == Some(ext), "ext binds");
+        kani::cover!(r.is_none(), "closed");
+    }
+
+    #[kani::proof]
+    fn proof_v3_effective_liquidity_min() {
+        let ctx: u128 = kani::any();
+        let ext: u128 = kani::any();
+        let r = v3_effective_liquidity(ctx, ext);
+        if ext == 0 {
+            assert_eq!(r, ctx);
+        } else {
+            assert_eq!(r, ctx.min(ext));
+        }
+        kani::cover!(ext == 0, "ext 0 keeps ctx");
+        kani::cover!(ext > 0 && ext < ctx, "ext binds");
+    }
+
+    /// Closed mode never grows |inventory| and never crosses zero. i128 compare-only.
+    #[kani::proof]
+    fn proof_v3_closed_mode_only_reduces_lp() {
+        let inv: i128 = kani::any();
+        kani::assume(inv != i128::MIN);
+        let is_buy: bool = kani::any();
+        let fill: u128 = kani::any();
+        let room = v3_closed_room(inv, is_buy);
+        kani::assume(fill <= room);
+        let f = fill as i128; // fill <= |inv| <= i128::MAX
+        let after = if is_buy { inv - f } else { inv + f };
+        assert!(after.unsigned_abs() <= inv.unsigned_abs());
+        assert!(after == 0 || (after > 0) == (inv > 0));
+        kani::cover!(is_buy && inv > 0 && fill > 0, "reducing buy");
+        kani::cover!(!is_buy && inv < 0 && fill > 0, "reducing sell");
+        kani::cover!(room == 0 && inv != 0, "growing request clipped to 0");
+        kani::cover!(inv == 0, "flat");
+    }
+
+    /// parse_v3: Ok ⇒ version 3 and cap <= i128::MAX; any other length fails.
+    #[kani::proof]
+    #[kani::unwind(80)]
+    fn proof_v3_parse_rejects_over_i128_cap() {
+        let b: [u8; CALL_EXT_V3_LEN] = kani::any();
+        let r = CallExt::parse_v3(&b);
+        if let Ok((_, caps)) = r {
+            assert!(b[0] == CALL_EXT_VERSION_V3 && caps.inventory_cap_q <= i128::MAX as u128);
+        }
+        assert!(CallExt::parse_v3(&b[..CALL_EXT_V3_LEN - 1]).is_err());
+        kani::cover!(r.is_ok(), "accepted");
+        kani::cover!(b[0] == CALL_EXT_VERSION_V3 && b[55] & 0x80 != 0 && r.is_err(), "over-i128 cap refused");
+    }
+
+    /// R1(2) / R14: `close_exempt ⇒` the returned limits equal the inputs; otherwise the cap
+    /// binds (finite) or the closed room binds (cap 0). Full u128 / i128.
+    #[kani::proof]
+    fn proof_v3_apply_caps_exempt_means_no_clip() {
+        let mi: u128 = kani::any();
+        let mf: u128 = kani::any();
+        let inv: i128 = kani::any();
+        kani::assume(inv != i128::MIN);
+        let cap: u128 = kani::any();
+        let buy: bool = kani::any();
+        let ex: bool = kani::any();
+        let c = v3_apply_caps(mi, mf, inv, cap, buy, ex);
+        if ex {
+            assert_eq!((c.max_inventory_abs, c.max_fill_abs), (mi, mf));
+        } else if cap == 0 {
+            assert!(c.max_fill_abs <= v3_closed_room(inv, buy) && c.max_fill_abs <= mf);
+        } else {
+            assert_eq!(Some(c.max_inventory_abs), v3_effective_max_inventory(mi, cap));
+        }
+        kani::cover!(ex && cap == 0 && v3_closed_room(inv, buy) < mf, "exempt in closed mode");
+        kani::cover!(ex && cap > 0 && cap < mi, "exempt under a binding cap");
+        kani::cover!(!ex && cap == 0 && c.max_fill_abs < mf, "closed clips");
+    }
+
+    /// R1(2): a close-exempt kind-2 leg fills in full; any other leg keeps the quote.
+    #[kani::proof]
+    fn proof_v3_close_exempt_fill_is_full() {
+        let ex: bool = kani::any();
+        let q: u128 = kani::any();
+        let qp: u64 = kani::any();
+        let fa: u128 = kani::any();
+        let cp: u64 = kani::any();
+        let (f, p) = v3_close_exempt_fill(ex, q, qp, fa, cp);
+        if ex {
+            assert!(f >= q.min(fa) && (f == fa || f == q));
+            if q < fa {
+                assert_eq!((f, p), (fa, cp));
+            }
+        } else {
+            assert_eq!((f, p), (q, qp));
+        }
+        kani::cover!(ex && q < fa, "budget-clipped close filled in full at the clamp");
+        kani::cover!(!ex && q < fa, "non-exempt keeps the clip");
+    }
+
+    /// Contract proof of the ceil divider. Bounded domain (u8 widened); lift in the results file.
+    #[kani::proof_for_contract(div_ceil)]
+    #[kani::solver(cadical)]
+    fn proof_div_ceil_contract() {
+        let a = kani::any::<u8>() as u128;
+        let b = kani::any::<u8>() as u128;
+        kani::assume(b > 0);
+        let r = div_ceil(a, b);
+        kani::cover!(a % b != 0 && r > 0, "rounds up");
+        kani::cover!(a == 0, "zero");
+    }
+
+    /// Depth reaches capacity: with D = DEPTH_MULT(4) * capacity notional, the CP impact at
+    /// full capacity is finite and <= ceil(k / 3). `div_ceil` by its proven contract. Bound:
+    /// u16 capacity notional, k <= 9000.
+    #[kani::proof]
+    #[kani::stub_verified(div_ceil)]
+    #[kani::solver(cadical)]
+    fn proof_growth_depth_reaches_capacity() {
+        let n: u16 = kani::any();
+        let k: u16 = kani::any();
+        kani::assume(n > 0 && k <= 9_000);
+        let d = 4 * n as u128;
+        let r = cp_impact_bps(n as u128, d, k as u32);
+        assert!(r.is_some());
+        // ceil(k*n / 3n) == ceil(k / 3): assert through the exact relation (no divider here)
+        let c: u128 = kani::any();
+        kani::assume(kani_spec::ceil_rel(k as u128, 3, c));
+        assert!(r.unwrap() <= c);
+        kani::cover!(r == Some(17) && k == 50, "pinned k = 50 -> 17 bps");
+        kani::cover!(k == 0, "k 0 -> 0");
+    }
 }
+

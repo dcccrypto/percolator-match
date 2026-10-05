@@ -84,6 +84,8 @@ pub const MATCHER_BATCH_MAX_LEGS: usize = 16;
 pub const MATCHER_CALL_LEN: usize = 67;
 /// Tag-0 call carrying a version-2 (40-byte) call extension: 43 + 40.
 pub const MATCHER_CALL_V2_LEN: usize = 83;
+/// growth-v19: a tag-0 call carrying a 72-byte version-3 extension (43 + 72).
+pub const MATCHER_CALL_V3_LEN: usize = 115;
 
 // =============================================================================
 // Matcher Return Layout (64 bytes)
@@ -296,7 +298,7 @@ impl MatcherCall {
         // `ext_version == 1` block carries the wrapper's mark_slot / LP headroom
         // (`v2::CallExt`); `ext_version == 2` (bytes 43..83) adds the LP's real engine
         // position. Anything else is rejected, exactly as before.
-        Self::parse_ext(data)?;
+        Self::parse_ext_caps(data)?;
 
         Ok(Self {
             req_id,
@@ -311,6 +313,30 @@ impl MatcherCall {
     /// when byte 43 is `CALL_EXT_VERSION_V2`, bytes 43..83 (v1 block + LP engine position).
     /// A v2 call must be exactly `MATCHER_CALL_V2_LEN` bytes.
     pub fn parse_ext(data: &[u8]) -> Result<v2::CallExt, ProgramError> {
+        Self::parse_ext_caps(data).map(|(e, _)| e)
+    }
+
+    /// `parse_ext` plus the growth-v19 version-3 caps: when byte 43 is `CALL_EXT_VERSION_V3`
+    /// the call must be exactly `MATCHER_CALL_V3_LEN` bytes (bytes 43..115).
+    pub fn parse_ext_caps(
+        data: &[u8],
+    ) -> Result<(v2::CallExt, Option<v2::ExtCapsV3>), ProgramError> {
+        if data.len() < MATCHER_CALL_LEN {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if data[v2::CALL_EXT_OFFSET] == v2::CALL_EXT_VERSION_V3 {
+            if data.len() != MATCHER_CALL_V3_LEN {
+                return Err(ProgramError::InvalidInstructionData);
+            }
+            return v2::CallExt::parse_v3(
+                &data[v2::CALL_EXT_OFFSET..v2::CALL_EXT_OFFSET + v2::CALL_EXT_V3_LEN],
+            )
+            .map(|(e, c)| (e, Some(c)));
+        }
+        Self::parse_ext_legacy(data).map(|e| (e, None))
+    }
+
+    fn parse_ext_legacy(data: &[u8]) -> Result<v2::CallExt, ProgramError> {
         if data.len() < MATCHER_CALL_LEN {
             return Err(ProgramError::InvalidInstructionData);
         }
