@@ -135,6 +135,23 @@ jobs:
       - name: LiteSVM suite (tests-litesvm/)
         run: cargo test --manifest-path tests-litesvm/Cargo.toml -- --test-threads=1
 
+  # Kani contracts must not change the program (growth-v19 rev 6, security review Q2.3):
+  # `div_ceil` / `skew_div` carry `#[cfg_attr(kani, kani::requires/ensures(..))]`. Build the .so
+  # with the deploy toolchain (cargo-build-sbf 3.1.15 / platform-tools v1.52) as committed and
+  # with those lines blanked; fail unless byte-identical. Local: ./scripts/kani-contracts-bytecheck.sh
+  kani-contracts-bytecheck:
+    name: Kani contracts leave the .so byte-identical
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install the deploy solana toolchain (cargo-build-sbf 3.1.15 / platform-tools v1.52)
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v3.1.15/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: byte-diff the .so with and without the Kani contracts
+        run: ./scripts/kani-contracts-bytecheck.sh
+
   parity:
     name: sdk parity fixture
     runs-on: ubuntu-latest
