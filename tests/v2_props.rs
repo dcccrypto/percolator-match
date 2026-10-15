@@ -3,7 +3,7 @@
 //! sample realistic magnitudes (u64 prices, 1e18-scale sizes) the solver cannot reach.
 
 use percolator_match::v2::{
-    adaptive_fee_bps, cp_impact_bps, cp_max_notional_for_budget, quote_adaptive, requested_fee_bps,
+    adaptive_fee_bps, cp_impact_bps, cp_max_notional_for_budget, quote_adaptive, price_with_total_bps, requested_fee_bps,
     skew_net_bps, AdaptiveQuoteIn, CallExt, V2Config, V2State,
 };
 use proptest::prelude::*;
@@ -172,6 +172,24 @@ proptest! {
         prop_assert!(f <= 1023);
     }
 
+    /// GH#36: the fee we REPORT must be the total we QUOTED. `price_with_total_bps` rounds the
+    /// price away from the taker, so recovering the bps with a second ceil returned `total + 1`
+    /// on ~99% of (price, total) pairs: at the clamp the wrapper refused the fill outright, and
+    /// below it the taker was charged a bp more than quoted. The round trip is exact for every
+    /// `oracle >= BPS`, on both sides.
+    #[test]
+    fn requested_fee_round_trips_the_quoted_total(
+        o in 10_000u64..=1_000_000_000_000,
+        t in 0u128..=1_000,
+        buy in any::<bool>(),
+    ) {
+        let p = price_with_total_bps(o, t, buy).unwrap();
+        prop_assert_eq!(
+            requested_fee_bps(o, p) as u128, t,
+            "oracle {} total {} buy {} priced {}", o, t, buy, p
+        );
+    }
+
     /// Dedicated monotonicity-in-size property on a domain where the size clip rarely
     /// binds, so the assertion is exercised on most cases (the general property above
     /// only reaches it ~2% of the time). Counted: at least half the cases must compare.
@@ -213,4 +231,28 @@ proptest! {
 thread_local! {
     static DENSE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static DENSE_RUNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// GH#36 (concrete, the case that broke the wrapper): at the matcher's own `max_total_bps`
+/// clamp of 100 bps, a realistic non-round oracle must report exactly 100 — not 101.
+///
+/// The wrapper pins `GROWTH_PIN_MAX_REQUESTED_FEE_BPS == PIN_MAX_TOTAL_BPS == 100` and refuses
+/// `requested > max`, so a 101 made the whole `TradeCpi` revert with Custom(9). Every existing
+/// test used a round price (1_000_000 / 10_000_000), where the old ceil happened to be exact,
+/// which is why this survived.
+#[test]
+fn clamp_priced_fill_reports_exactly_the_clamp_on_non_round_oracles() {
+    const MAX_TOTAL: u128 = 100;
+    const WRAPPER_CAP: u32 = 100; // GROWTH_PIN_MAX_REQUESTED_FEE_BPS
+    for o in [150_123_456u64, 10_234_567, 1_000_001, 999_983, 250_000_007] {
+        for buy in [true, false] {
+            let p = price_with_total_bps(o, MAX_TOTAL, buy).unwrap();
+            let got = requested_fee_bps(o, p);
+            assert_eq!(got, MAX_TOTAL as u32, "oracle {o} buy {buy} priced {p}");
+            assert!(got <= WRAPPER_CAP, "the wrapper would refuse {got} > {WRAPPER_CAP}");
+        }
+    }
+    // Control: a round price was always exact, which is why the old tests passed.
+    let p = price_with_total_bps(150_123_400, MAX_TOTAL, true).unwrap();
+    assert_eq!(requested_fee_bps(150_123_400, p), 100);
 }

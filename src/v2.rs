@@ -411,7 +411,19 @@ pub fn requested_fee_bps(oracle_e6: u64, exec_price_e6: u64) -> u32 {
     }
     let o = oracle_e6 as u128;
     let d = (exec_price_e6 as u128).abs_diff(o);
-    let bps = div_ceil(d * BPS, o);
+    // GH#36: FLOOR, not ceil. `price_with_total_bps` has ALREADY rounded the price away from
+    // the taker, so `d == ceil(o * total / BPS)`. Recovering the bps with a second ceil
+    // double-counts that rounding and returns `total + 1` whenever `o * total` is not a
+    // multiple of BPS -- about 99% of (price, total) pairs. Two consequences, both fixed by
+    // flooring: at the clamp the wrapper refused the whole fill (`requested > max_total`, its
+    // `GROWTH_PIN_MAX_REQUESTED_FEE_BPS` is pinned equal to our `max_total_bps`), and below
+    // the clamp the taker was charged one bp more than we quoted -- this value IS the charge,
+    // since the spread in `exec_price` transfers nothing (the wrapper settles at the mark).
+    //
+    // Flooring recovers the quote exactly: with `d = ceil(o*t/BPS) = (o*t + r)/BPS`, `0 <= r <
+    // BPS`, we get `d*BPS/o = t + r/o`, so the floor is exactly `t` for every `o >= BPS`.
+    // It can never report BELOW the quoted total, and never above what `ceil` reported.
+    let bps = (d * BPS) / o;
     bps.min(crate::REQUESTED_FEE_BPS_MAX as u128) as u32
 }
 
