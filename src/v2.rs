@@ -399,7 +399,7 @@ impl CallExt {
 }
 
 /// The matcher's quote expressed as a taker fee on mark-settled notional:
-/// ceil(|exec - oracle| * 1e4 / oracle), capped at `crate::REQUESTED_FEE_BPS_MAX`.
+/// floor(|exec - oracle| * 1e4 / oracle) (GH#36: recovers the quote), capped at `crate::REQUESTED_FEE_BPS_MAX`.
 ///
 /// Why: on v18.2 the wrapper settles every fill at the asset mark and uses the matcher's
 /// exec_price only for the taker limit check / hybrid mark input (percolator-prog
