@@ -96,9 +96,20 @@ fn check_exec(kind: u8) {
     }
 }
 
+/// Over-approximation of `compute_skew_extra_bps_units` for K-M1/K-M2: any value in [0, 5000]. The real
+/// function is `min(extra, 5000)` (or 0), so every value it can return lies in this range; K-M3 proves that
+/// on the REAL function. The bounds in K-M1/K-M2 hold for EVERY skew value in the range, so nothing is lost by
+/// not carrying the u128 variable division `inv * mult / max_inventory_abs` through the price proofs.
+fn skew_any_le_cap(_ctx: &MatcherCtx, _is_buy: bool, _v3_units: bool) -> u128 {
+    let x: u128 = kani::any();
+    kani::assume(x <= 5000);
+    x
+}
+
 /// K-M1: production Passive pricing: bounds, fill, flags, inventory cap.
 #[kani::proof]
 #[kani::unwind(81)]
+#[kani::stub(super::compute_skew_extra_bps_units, skew_any_le_cap)]
 fn kani_audit1017_m1_passive_execution_bounds() {
     check_exec(MatcherKind::Passive as u8);
 }
@@ -106,6 +117,30 @@ fn kani_audit1017_m1_passive_execution_bounds() {
 /// K-M2: production vAMM pricing (impact clamped by max_total): same bounds.
 #[kani::proof]
 #[kani::unwind(81)]
+#[kani::stub(super::compute_skew_extra_bps_units, skew_any_le_cap)]
 fn kani_audit1017_m2_vamm_execution_bounds() {
     check_exec(MatcherKind::Vamm as u8);
+}
+
+/// K-M3: the REAL skew surcharge is 0 unless the trade worsens the LP's inventory and a multiplier is set,
+/// and never exceeds 5000 bps (the cap the K-M1/K-M2 stub relies on).
+#[kani::proof]
+#[kani::unwind(3)]
+fn kani_audit1017_m3_skew_extra_capped_and_side_correct() {
+    let kind: u8 = if kani::any() { MatcherKind::Vamm as u8 } else { MatcherKind::Passive as u8 };
+    let ctx = any_ctx(kind);
+    let is_buy: bool = kani::any();
+    let v3: bool = kani::any();
+    let e = compute_skew_extra_bps_units(&ctx, is_buy, v3);
+    assert!(e <= 5000);
+    if ctx.skew_spread_mult_bps == 0 {
+        assert!(e == 0);
+    }
+    // buy worsens only a short LP; sell worsens only a long LP
+    if (is_buy && ctx.inventory_base >= 0) || (!is_buy && ctx.inventory_base <= 0) {
+        assert!(e == 0);
+        kani::cover!(ctx.skew_spread_mult_bps > 0, "non-worsening side pays no surcharge though a multiplier is set");
+    }
+    kani::cover!(e > 0 && e < 5000, "surcharge strictly inside the cap");
+    kani::cover!(e == 5000, "cap binds");
 }
