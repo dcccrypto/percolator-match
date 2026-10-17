@@ -4301,3 +4301,7 @@ mod proofs {
         kani::cover!(ctx_inv.validate().is_err() && ctx_fill.validate().is_err(), "concrete harness: both rejections reached");
     }
 }
+
+#[cfg(kani)]
+#[path = "kani_audit_1017.rs"]
+mod kani_audit_1017;
