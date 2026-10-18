@@ -144,3 +144,54 @@ fn kani_audit1017_m3_skew_extra_capped_and_side_correct() {
     kani::cover!(e > 0 && e < 5000, "surcharge strictly inside the cap");
     kani::cover!(e == 5000, "cap binds");
 }
+
+// ---- split harnesses (K-M4/K-M5): price bounds only, in the domain production actually admits -------------
+// `process_call` refuses `oracle_price_e6 > ORACLE_PRICE_E6_MAX` before pricing (vamm.rs:699), so the price
+// proofs quantify the oracle over [0, ORACLE_PRICE_E6_MAX] (a 50-bit multiplicand instead of 64).
+// max_inventory_abs = 0 (no cap) and max_fill_abs = i128::MAX make fill == request; fill / cap behaviour is
+// K-M1's job and `check_inventory_limit` has its own production proof.
+fn check_price(kind: u8) {
+    let mut ctx = any_ctx(kind);
+    ctx.max_inventory_abs = 0;
+    ctx.max_fill_abs = i128::MAX as u128;
+    kani::assume(ctx.validate().is_ok());
+    let oracle: u64 = kani::any();
+    kani::assume(oracle <= crate::ORACLE_PRICE_E6_MAX);
+    let req: i128 = kani::any();
+    kani::assume(req != 0 && req > i64::MIN as i128 && req < i64::MAX as i128);
+    let call = MatcherCall { req_id: 1, asset_index: 0, lp_account_id: 0, oracle_price_e6: oracle, req_size: req };
+    let v3: bool = kani::any();
+    if let Ok((price, size, _)) = compute_execution_units(&ctx, &call, v3) {
+        assert!(size == req);
+        let o = oracle as u128;
+        let m = ctx.max_total_bps as u128;
+        let p = price as u128;
+        if req > 0 {
+            assert!(p >= o);
+            assert!(p * 10_000 <= o * (10_000 + m) + 9_999);
+            kani::cover!(p > o, "buy strictly above oracle");
+        } else {
+            assert!(p <= o);
+            assert!(p * 10_000 + 9_999 >= o * (10_000 - m));
+            kani::cover!(p < o, "sell strictly below oracle");
+        }
+    } else {
+        kani::cover!(true, "refused (overflow / zero price)");
+    }
+}
+
+/// K-M4: production Passive price within [oracle*(1-max_total), oracle*(1+max_total)], rounded toward the LP.
+#[kani::proof]
+#[kani::unwind(81)]
+#[kani::stub(super::compute_skew_extra_bps_units, skew_any_le_cap)]
+fn kani_audit1017_m4_passive_price_bounds() {
+    check_price(MatcherKind::Passive as u8);
+}
+
+/// K-M5: same for the vAMM (impact clamped by max_total).
+#[kani::proof]
+#[kani::unwind(81)]
+#[kani::stub(super::compute_skew_extra_bps_units, skew_any_le_cap)]
+fn kani_audit1017_m5_vamm_price_bounds() {
+    check_price(MatcherKind::Vamm as u8);
+}
