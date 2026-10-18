@@ -4305,3 +4305,7 @@ mod proofs {
 #[cfg(kani)]
 #[path = "kani_audit_1017.rs"]
 mod kani_audit_1017;
+
+#[cfg(test)]
+#[path = "audit_1017_native.rs"]
+mod audit_1017_native;

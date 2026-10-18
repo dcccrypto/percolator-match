@@ -150,13 +150,13 @@ fn kani_audit1017_m3_skew_extra_capped_and_side_correct() {
 // proofs quantify the oracle over [0, ORACLE_PRICE_E6_MAX] (a 50-bit multiplicand instead of 64).
 // max_inventory_abs = 0 (no cap) and max_fill_abs = i128::MAX make fill == request; fill / cap behaviour is
 // K-M1's job and `check_inventory_limit` has its own production proof.
-fn check_price(kind: u8) {
+fn check_price(kind: u8, oracle_bound: u64) {
     let mut ctx = any_ctx(kind);
     ctx.max_inventory_abs = 0;
     ctx.max_fill_abs = i128::MAX as u128;
     kani::assume(ctx.validate().is_ok());
     let oracle: u64 = kani::any();
-    kani::assume(oracle <= crate::ORACLE_PRICE_E6_MAX);
+    kani::assume(oracle <= oracle_bound);
     let req: i128 = kani::any();
     kani::assume(req != 0 && req > i64::MIN as i128 && req < i64::MAX as i128);
     let call = MatcherCall { req_id: 1, asset_index: 0, lp_account_id: 0, oracle_price_e6: oracle, req_size: req };
@@ -185,7 +185,7 @@ fn check_price(kind: u8) {
 #[kani::unwind(81)]
 #[kani::stub(super::compute_skew_extra_bps_units, skew_any_le_cap)]
 fn kani_audit1017_m4_passive_price_bounds() {
-    check_price(MatcherKind::Passive as u8);
+    check_price(MatcherKind::Passive as u8, crate::ORACLE_PRICE_E6_MAX);
 }
 
 /// K-M5: same for the vAMM (impact clamped by max_total).
@@ -193,5 +193,23 @@ fn kani_audit1017_m4_passive_price_bounds() {
 #[kani::unwind(81)]
 #[kani::stub(super::compute_skew_extra_bps_units, skew_any_le_cap)]
 fn kani_audit1017_m5_vamm_price_bounds() {
-    check_price(MatcherKind::Vamm as u8);
+    check_price(MatcherKind::Vamm as u8, crate::ORACLE_PRICE_E6_MAX);
 }
+
+/// K-M4s / K-M5s: BOUNDED twins of K-M4 / K-M5 with oracle <= 2^20 (the full-range versions are NO-VERDICT:
+/// the proof needs multiplication monotonicity at a 50-bit multiplicand, which bit-blasting does not decide
+/// in 2400 s). The formulas are scale-free in the oracle; the full 64-bit range is sampled natively below.
+#[kani::proof]
+#[kani::unwind(81)]
+#[kani::stub(super::compute_skew_extra_bps_units, skew_any_le_cap)]
+fn kani_audit1017_m4s_passive_price_bounds_oracle_le_2p20() {
+    check_price(MatcherKind::Passive as u8, 1 << 20);
+}
+
+#[kani::proof]
+#[kani::unwind(81)]
+#[kani::stub(super::compute_skew_extra_bps_units, skew_any_le_cap)]
+fn kani_audit1017_m5s_vamm_price_bounds_oracle_le_2p20() {
+    check_price(MatcherKind::Vamm as u8, 1 << 20);
+}
+
