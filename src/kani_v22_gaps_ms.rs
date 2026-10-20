@@ -202,3 +202,47 @@ fn ms_imp_vamm_impact_never_overflows_in_documented_domain() {
         kani::cover!(big_impact && ctx.max_total_bps > 0, "impact at/over the max_total budget (clamp binds)");
     }
 }
+
+/// MS-PW: the kind-2 (Adaptive) pricing kernel `v2::price_with_total_bps`, full u64 oracle, any
+/// total: refuses total > 1e4; otherwise exactly one multiply `oracle * (1e4 +- total)` and the
+/// price is its exact ceil (ask) / floor (bid) over 1e4, never 0. With the z3-Int lemma
+/// (matcher_price.py, m = bf = total) this gives `price >= oracle` (taker buys) and
+/// `price <= oracle` (taker sells): the price half of `proof_quote_never_crosses_oracle`.
+#[kani::proof]
+#[kani::stub(u128::checked_mul, checked_mul_rec)]
+fn ms_pw_v2_price_with_total_bps_structural() {
+    let o: u64 = kani::any();
+    let t: u128 = kani::any();
+    let buys: bool = kani::any();
+    unsafe {
+        MUL_N = 0;
+    }
+    let r = crate::v2::price_with_total_bps(o, t, buys);
+    let (log, n) = unsafe { (MUL_LOG, MUL_N) };
+    if t > 10_000 {
+        assert!(r.is_none() && n == 0, "total above 100% refused before any multiply");
+        kani::cover!(true, "COVER: total > 1e4 refused");
+        return;
+    }
+    assert!(n == 1, "exactly one multiply");
+    assert!(log[0].0 == o as u128, "multiplicand is the oracle");
+    match r {
+        None => kani::cover!(true, "COVER: overflow / zero price refused"),
+        Some(price) => {
+            let p = price as u128;
+            let x = log[0].2;
+            assert!(x.is_some(), "a price comes from a non-overflowing product");
+            let x = x.unwrap_or(0);
+            assert!(p >= 1);
+            if buys {
+                assert!(log[0].1 == 10_000 + t);
+                assert!(p * 10_000 >= x && x.checked_add(9_999).is_some_and(|y| p * 10_000 <= y), "exact ceil");
+                kani::cover!(p * 10_000 > x && t > 0, "COVER: ask rounded up");
+            } else {
+                assert!(log[0].1 == 10_000 - t);
+                assert!(p * 10_000 <= x && p * 10_000 + 9_999 >= x, "exact floor");
+                kani::cover!(p * 10_000 < x && t > 0, "COVER: bid rounded down");
+            }
+        }
+    }
+}
