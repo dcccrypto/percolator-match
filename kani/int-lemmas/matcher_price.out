@@ -1,0 +1,11 @@
+ASK premises: sat (expected sat) OK model=[bf = 0, x = 0, o = 0, m = 0, p = 0, b = 10000]
+ASK p >= o: unsat (expected unsat) OK
+ASK p*1e4 <= o*(1e4+m) + 9999: unsat (expected unsat) OK
+ASK tight control (at the cap: p*1e4 + 1e4 > o*(1e4+m) reachable): sat (expected sat) OK model=[bf = 0, x = 10000, o = 1, m = 1, p = 1, b = 10000]
+ASK mutant control (ceil + 1): sat (expected sat) OK model=[bf = 0, x = 0, o = 0, m = 0, p = 1, b = 10000]
+BID premises: sat (expected sat) OK model=[bf = 0, x = 10000, o = 10, m = 9000, p = 1, b = 1000]
+BID p <= o: unsat (expected unsat) OK
+BID p*1e4 + 9999 >= o*(1e4-m): unsat (expected unsat) OK
+BID tight control (strictly below the oracle reachable): sat (expected sat) OK model=[bf = 0, x = 10000, o = 10, m = 9000, p = 1, b = 1000]
+BID mutant control (floor - 1): sat (expected sat) OK model=[bf = 0, x = 20000, o = 2, m = 0, p = 1, b = 10000]
+RESULT: ALL AS EXPECTED

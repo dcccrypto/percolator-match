@@ -4309,3 +4309,7 @@ mod kani_audit_1017;
 #[cfg(test)]
 #[path = "audit_1017_native.rs"]
 mod audit_1017_native;
+
+#[cfg(kani)]
+#[path = "kani_v22_gaps_ms.rs"]
+mod kani_v22_gaps_ms;
