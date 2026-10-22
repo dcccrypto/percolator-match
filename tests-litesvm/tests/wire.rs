@@ -156,8 +156,10 @@ fn fee_ext(accepts: bool, headroom: Option<u64>) -> CallExt {
 }
 
 fn want_fee(oracle: u64, exec: u64) -> u32 {
+    // GH#36: FLOOR. The exec price is already rounded away from the taker, so the floor recovers
+    // the quoted total exactly (a ceil here reported total + 1 at non-round prices).
     let d = (exec as i128 - oracle as i128).unsigned_abs();
-    (d * 10_000).div_ceil(oracle as u128).min(1023) as u32
+    ((d * 10_000) / oracle as u128).min(1023) as u32
 }
 
 #[test]
