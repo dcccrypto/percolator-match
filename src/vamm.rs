@@ -1377,6 +1377,15 @@ fn compute_skew_extra_bps(ctx: &MatcherCtx, is_buy: bool) -> u128 {
 /// `compute_skew_extra_bps` with the growth-v19 unit switch. `v3_units` is true ONLY when the
 /// call carries an ACTIVE ext-v3 inventory cap (security review L-1: the unit fix is opt-in,
 /// every legacy / v1 / v2 call keeps the deployed formula byte for byte).
+/// Skew-units floor division (Kani A1: a named boundary so `stub_verified` replaces the one
+/// divider). `den > 0` at both call sites (a non-zero cap, or 10_000).
+#[inline(always)]
+#[cfg_attr(kani, kani::requires(den > 0))]
+#[cfg_attr(kani, kani::ensures(|r: &u128| crate::v2::kani_spec::floor_rel(num, den, *r)))]
+fn skew_div(num: u128, den: u128) -> u128 {
+    num / den
+}
+
 fn compute_skew_extra_bps_units(ctx: &MatcherCtx, is_buy: bool, v3_units: bool) -> u128 {
     if ctx.skew_spread_mult_bps == 0 {
         return 0;
@@ -1412,9 +1421,9 @@ fn compute_skew_extra_bps_units(ctx: &MatcherCtx, is_buy: bool, v3_units: bool) 
         && ctx.max_inventory_abs != 0
         && ctx.max_inventory_abs <= SKEW_REF_MAX_INVENTORY_Q
     {
-        inv_abs.saturating_mul(mult) / ctx.max_inventory_abs
+        skew_div(inv_abs.saturating_mul(mult), ctx.max_inventory_abs)
     } else {
-        inv_abs.saturating_mul(mult) / 10_000
+        skew_div(inv_abs.saturating_mul(mult), 10_000)
     };
     // Saturate to avoid unbounded growth — cap at 5000 bps extra (50%)
     core::cmp::min(extra, 5000)
@@ -4210,4 +4219,126 @@ mod proofs {
             "validate must reject max_fill_abs > i128::MAX"
         );
     }
+
+    // ── growth-v19 (design note §3, rev 3 R3/R4; run once 2026-10-04) ─────────────────────
+
+    /// Contract proof of the skew divider (the only divider in the skew path). Bounded domain
+    /// (u8 operands widened); lift: exact floor is width-independent (results file).
+    #[kani::proof_for_contract(skew_div)]
+    #[kani::solver(cadical)]
+    fn proof_skew_div_contract() {
+        let n = kani::any::<u8>() as u128;
+        let d = kani::any::<u8>() as u128;
+        kani::assume(d > 0);
+        let r = skew_div(n, d);
+        kani::cover!(r > 0 && n % d != 0, "inexact floor");
+        kani::cover!(r == 0 && n > 0, "rounds to 0");
+    }
+
+    /// Kind-1 skew under v3 units: capped at 5000, monotone in |inv|, |inv| == cap gives
+    /// min(mult, 5000); kind 0 / 2 and v3_units == false keep the legacy formula. The divider is
+    /// `skew_div` by its proven contract (values asserted through the exact floor relation).
+    /// Bound: u16 inv / cap.
+    #[kani::proof]
+    #[kani::stub_verified(skew_div)]
+    fn proof_kind1_skew_units_capped_and_monotone() {
+        let i1: u16 = kani::any();
+        let i2: u16 = kani::any();
+        let cap: u16 = kani::any();
+        let mult: u16 = kani::any();
+        let kind: u8 = kani::any();
+        kani::assume(i1 <= i2 && cap > 0 && mult > 0 && kind <= 2);
+        let mk = |i: u16| MatcherCtx {
+            kind,
+            inventory_base: -(i as i128),
+            skew_spread_mult_bps: mult,
+            max_inventory_abs: cap as u128,
+            ..MatcherCtx::default()
+        };
+        let a = compute_skew_extra_bps_units(&mk(i1), true, true);
+        let b = compute_skew_extra_bps_units(&mk(i2), true, true);
+        assert!(a <= 5000 && b <= 5000 && a <= b);
+        let v3 = kind == MatcherKind::Vamm as u8;
+        if v3 && i2 == cap {
+            assert_eq!(b, core::cmp::min(mult as u128, 5000));
+        }
+        if !v3 && i1 > 0 {
+            // legacy: min(floor(|inv| * mult / 1e4), 5000)
+            let q: u128 = kani::any();
+            kani::assume(crate::v2::kani_spec::floor_rel(i1 as u128 * mult as u128, 10_000, q));
+            assert_eq!(a, core::cmp::min(q, 5000));
+        }
+        kani::cover!(v3 && i2 == cap && b == mult as u128, "|inv| == cap -> mult");
+        kani::cover!(v3 && a < b, "monotone, strict");
+        kani::cover!(v3 && a == b && i1 < i2, "monotone, equal");
+        kani::cover!(kind == 0 && i1 > 0 && a > 0, "kind 0 keeps the legacy formula");
+    }
+
+    /// R4: with `v3_units == false` the result is the deployed b5b419d formula
+    /// `min(floor(sat(|inv| * mult) / 1e4), 5000)` for EVERY ctx (all kinds, any cap), and 0 when
+    /// the fill does not worsen the inventory or mult == 0. Full-width inventory and cap.
+    #[kani::proof]
+    #[kani::stub_verified(skew_div)]
+    fn proof_kind1_units_only_under_v3() {
+        let inv: i128 = kani::any();
+        kani::assume(inv != i128::MIN);
+        let ctx = MatcherCtx {
+            kind: kani::any(),
+            inventory_base: inv,
+            skew_spread_mult_bps: kani::any(),
+            max_inventory_abs: kani::any(),
+            ..MatcherCtx::default()
+        };
+        let buy: bool = kani::any();
+        let r = compute_skew_extra_bps_units(&ctx, buy, false);
+        let worsens = if buy { inv < 0 } else { inv > 0 };
+        if ctx.skew_spread_mult_bps == 0 || !worsens {
+            assert_eq!(r, 0);
+        } else {
+            let p = inv.unsigned_abs().saturating_mul(ctx.skew_spread_mult_bps as u128);
+            let q: u128 = kani::any();
+            kani::assume(crate::v2::kani_spec::floor_rel(p, 10_000, q));
+            assert_eq!(r, core::cmp::min(q, 5000));
+        }
+        kani::cover!(worsens && ctx.skew_spread_mult_bps > 0 && r > 0 && r < 5000, "legacy, uncapped");
+        kani::cover!(worsens && r == 5000, "legacy, capped");
+        kani::cover!(ctx.kind == MatcherKind::Vamm as u8 && worsens && ctx.max_inventory_abs > 0 && r > 0, "kind 1 without v3 keeps legacy units");
+    }
+
+    /// R3: neutral ext-v3 caps (inventory cap >= 1e14, liquidity u128::MAX) on a non-reducing
+    /// leg give EXACTLY the v2 effective context (no clip, no unit change).
+    #[kani::proof]
+    fn proof_v3_neutral_caps_equal_v2() {
+        let ctx = MatcherCtx {
+            kind: kani::any(),
+            max_total_bps: kani::any(),
+            liquidity_notional_e6: kani::any(),
+            max_fill_abs: kani::any(),
+            inventory_base: kani::any(),
+            max_inventory_abs: kani::any(),
+            ..MatcherCtx::default()
+        };
+        kani::assume(ctx.inventory_base != i128::MIN);
+        let mut ext = v2::CallExt::default();
+        ext.exec_band_bps = if kani::any() { Some(kani::any()) } else { None };
+        ext.headroom_q = if kani::any() { Some(kani::any()) } else { None };
+        let used: u128 = kani::any();
+        let buy: bool = kani::any();
+        let cap: u128 = kani::any();
+        kani::assume(cap >= SKEW_REF_MAX_INVENTORY_Q);
+        let neutral = v2::ExtCapsV3 {
+            inventory_cap_q: cap,
+            liquidity_notional_e6: u128::MAX,
+        };
+        let a = v3_effective_ctx(&ctx, &ext, None, buy, used);
+        let b = v3_effective_ctx(&ctx, &ext, Some(neutral), buy, used);
+        assert!(!b.cap_active && !b.close_exempt && b.skew_ref_cap.is_none());
+        assert_eq!(a.ctx.max_inventory_abs, b.ctx.max_inventory_abs);
+        assert_eq!(a.ctx.max_fill_abs, b.ctx.max_fill_abs);
+        assert_eq!(a.ctx.max_total_bps, b.ctx.max_total_bps);
+        assert_eq!(a.ctx.liquidity_notional_e6, b.ctx.liquidity_notional_e6);
+        kani::cover!(ext.headroom_q.is_some() && b.ctx.max_fill_abs < ctx.max_fill_abs, "headroom clips both");
+        kani::cover!(cap == SKEW_REF_MAX_INVENTORY_Q, "threshold boundary is neutral");
+    }
 }
+
