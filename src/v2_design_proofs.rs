@@ -1,0 +1,276 @@
+//! Kani design 2026-09-30 (Sentinel) — P2 matcher v2 FINAL `4a0f696`.
+//! Design doc: ~/percolator-ops/ledger/kani-proof-design-2026-09-30.md (entries D-P2-*).
+//! A child module of `v2` so the private pricing fns are called / stubbed in place.
+//! Run: cargo kani -Z stubbing --lib --exact --harness v2::design_proofs::<name>
+
+use super::*;
+
+// ── stubs ───────────────────────────────────────────────────────────────────────────────
+
+/// Spec of `price_with_total_bps` (proven by D-P2-01): `None` or a price on the LP's side of
+/// the oracle.
+fn spec_price_with_total_bps(oracle_e6: u64, total_bps: u128, taker_buys: bool) -> Option<u64> {
+    if total_bps > BPS {
+        return None;
+    }
+    let ok: bool = kani::any();
+    if !ok {
+        return None;
+    }
+    let p: u64 = kani::any();
+    kani::assume(p > 0);
+    if taker_buys {
+        kani::assume(p >= oracle_e6);
+    } else {
+        kani::assume(p <= oracle_e6);
+    }
+    if total_bps == 0 {
+        kani::assume(p == oracle_e6);
+    }
+    Some(p)
+}
+
+/// Arbitrary impact / skew, bounded only so the i128 sum in `quote_adaptive` cannot overflow
+/// (real skew is bounded by the skew cap, far below 2^64; real impact is clamped to 9_000
+/// before the sum). Sound over-approximation of the real `impact_and_skew`.
+fn stub_impact_and_skew_any(_q: &AdaptiveQuoteIn, _fill: u128) -> Option<(u128, i128)> {
+    if kani::any() {
+        return None;
+    }
+    let i: u128 = kani::any();
+    let s: i128 = kani::any();
+    kani::assume(s.unsigned_abs() < (1u128 << 64));
+    Some((i, s))
+}
+
+/// Arbitrary gross surcharge (any value, any None) — for D-P2-02, where the property must hold
+/// whatever the size clip decides.
+fn stub_gross_any(_q: &AdaptiveQuoteIn, _fill: u128) -> Option<u128> {
+    if kani::any() {
+        return None;
+    }
+    Some(kani::any())
+}
+
+static mut THRESHOLD: u128 = 0;
+/// Threshold model of a MONOTONE feasibility predicate: `gross_pos(f) <= max_total` iff
+/// `f <= T`, T fixed per run. Every monotone predicate over fill sizes is of this form, so
+/// D-P2-03 is exact for any real `gross_pos_bps` that is monotone in fill (lemma L-GROSS).
+fn stub_gross_threshold(q: &AdaptiveQuoteIn, fill: u128) -> Option<u128> {
+    let _ = q;
+    if fill <= unsafe { THRESHOLD } {
+        Some(0)
+    } else {
+        Some(u128::MAX)
+    }
+}
+
+fn any_quote_admitted() -> AdaptiveQuoteIn {
+    let q = AdaptiveQuoteIn {
+        oracle_e6: kani::any(),
+        fill: kani::any(),
+        taker_buys: kani::any(),
+        inv_pre: kani::any(),
+        base_spread_bps: kani::any(),
+        max_total_bps: kani::any(),
+        fee_bps: kani::any(),
+        impact_k_bps: kani::any(),
+        depth_e6: kani::any(),
+        s_mult_bps: kani::any(),
+        r_mult_bps: kani::any(),
+        skew_cap_bps: kani::any(),
+        rebate_cap_bps: kani::any(),
+        ref_inv: kani::any(),
+    };
+    // The executor's own invariants (execute_leg): the fee is the adaptive fee <= fee_hi <=
+    // MAX_FEE_BPS; base spread and max total are validate_config-bounded u32; fill <= i128::MAX.
+    kani::assume(q.fee_bps <= MAX_FEE_BPS as u128);
+    kani::assume(q.fill <= i128::MAX as u128);
+    kani::assume(q.oracle_e6 > 0);
+    q
+}
+
+// ── D-P2-01  `price_with_total_bps`, FULL u64 oracle and every total <= 1e4: never prices
+// through the oracle in the taker's favour; `None` only for p == 0 or p > u64::MAX.
+#[kani::proof]
+#[kani::solver(kissat)]
+fn kani_design_p2_01_price_never_crosses_full_width() {
+    let o: u64 = kani::any();
+    let t: u128 = kani::any();
+    let buys: bool = kani::any();
+    kani::assume(t <= BPS);
+    let r = price_with_total_bps(o, t, buys);
+    if let Some(p) = r {
+        if buys {
+            assert!(p >= o);
+        } else {
+            assert!(p <= o);
+        }
+        if t == 0 {
+            assert_eq!(p, o);
+        }
+    }
+    if o > 0 && buys && t == 0 {
+        assert_eq!(r, Some(o));
+    }
+    kani::cover!(matches!(r, Some(p) if buys && p > o), "buy priced above the oracle");
+    kani::cover!(matches!(r, Some(p) if !buys && p < o && o > u32::MAX as u64), "sell priced below a > u32 oracle");
+    kani::cover!(r.is_none() && o > 0 && buys, "buy above u64::MAX fails closed");
+    kani::cover!(r.is_none() && o > 0 && !buys, "sell rounding to 0 fails closed");
+}
+
+// ── D-P2-02  `quote_adaptive` over the WHOLE admitted input domain (no bound on slopes, ref
+// inventory, depth, inventory, oracle), with impact/skew/gross arbitrary and the price fn at its
+// verified spec: whenever it quotes, fill <= request, total <= min(max_total, 9000), and the
+// price is never through the oracle in the taker's favour; a zero fill quotes the oracle.
+#[kani::proof]
+#[kani::unwind(130)]
+#[kani::stub(impact_and_skew, stub_impact_and_skew_any)]
+#[kani::stub(gross_pos_bps, stub_gross_any)]
+#[kani::stub(price_with_total_bps, spec_price_with_total_bps)]
+fn kani_design_p2_02_quote_never_crosses_any_domain() {
+    let q = any_quote_admitted();
+    let r = quote_adaptive(&q);
+    if let Some((fill, price, total)) = r {
+        assert!(fill <= q.fill);
+        assert!(total <= (q.max_total_bps as u128).min(9_000));
+        if fill == 0 {
+            assert_eq!(price, q.oracle_e6);
+            assert_eq!(total, 0);
+        } else if q.taker_buys {
+            assert!(price >= q.oracle_e6);
+        } else {
+            assert!(price <= q.oracle_e6);
+        }
+        kani::cover!(fill > 0 && fill < q.fill, "size clip exercised");
+        kani::cover!(fill > 0 && q.taker_buys && price > q.oracle_e6, "buy priced above oracle");
+        kani::cover!(fill > 0 && q.s_mult_bps > 10_000 && q.ref_inv == u64::MAX, "(fields unread under the impact/skew stub: this cover only shows the admitted domain is not narrowed by assumes)");
+    }
+}
+
+// ── D-P2-03  Realised fill is monotone in the REQUESTED size, and a request that reduces the
+// LP is always fillable up to |inventory|, for the REAL binary search in `quote_adaptive` over
+// ANY monotone feasibility predicate (threshold model) and arbitrary impact/skew.
+#[kani::proof]
+#[kani::unwind(130)]
+#[kani::stub(impact_and_skew, stub_impact_and_skew_any)]
+#[kani::stub(gross_pos_bps, stub_gross_threshold)]
+#[kani::stub(price_with_total_bps, spec_price_with_total_bps)]
+fn kani_design_p2_03_fill_monotone_in_request() {
+    let t: u128 = kani::any();
+    unsafe { THRESHOLD = t };
+    let q = any_quote_admitted();
+    let bigger: u128 = kani::any();
+    kani::assume(bigger >= q.fill && bigger <= i128::MAX as u128);
+    let mut q2 = q;
+    q2.fill = bigger;
+    let r1 = quote_adaptive(&q);
+    let r2 = quote_adaptive(&q2);
+    if let (Some((f1, _, _)), Some((f2, _, _))) = (r1, r2) {
+        assert!(f1 <= f2, "a larger request never fills less");
+        // feasible prefix: fill = min(request, T) unless the LP-reducing exemption lifts it
+        let lp_reduces = (q.taker_buys && q.inv_pre > 0) || (!q.taker_buys && q.inv_pre < 0);
+        let base = q.fill.min(t);
+        let expect = if lp_reduces { base.max(q.fill.min(q.inv_pre.unsigned_abs())) } else { base };
+        assert_eq!(f1, expect);
+        kani::cover!(f1 < q.fill && !lp_reduces && f1 > 0, "clipped to the feasible prefix");
+        kani::cover!(lp_reduces && f1 > t, "reducing exemption fills past the clip");
+    }
+}
+
+// ── D-P2-01s  u32-oracle regression twin of D-P2-01 (the pre-declared fallback if the full-u64
+// harness has no verdict in 1 h; with L-PRICE on paper for full width).
+#[kani::proof]
+#[kani::solver(kissat)]
+fn kani_design_p2_01s_price_never_crosses_u32() {
+    let o: u32 = kani::any();
+    let t: u128 = kani::any();
+    let buys: bool = kani::any();
+    kani::assume(t <= BPS);
+    let r = price_with_total_bps(o as u64, t, buys);
+    if let Some(p) = r {
+        if buys { assert!(p >= o as u64); } else { assert!(p <= o as u64); }
+        if t == 0 { assert_eq!(p, o as u64); }
+    }
+    kani::cover!(matches!(r, Some(p) if buys && p > o as u64), "buy above oracle");
+    kani::cover!(matches!(r, Some(p) if !buys && p < o as u64), "sell below oracle");
+}
+
+// ── D-P2-06s  Skew potential DISCRETE CONVEXITY at small width (u8 x/m/c/r): the increment
+// W(x+1)-W(x) never shrinks. This is the code-level fact L-CONVEX needs (the knee
+// `floor(c*r/m)`, v2.rs:627); a ceil-knee mutant breaks convexity (not monotonicity) and reds here.
+#[kani::proof]
+#[kani::solver(kissat)]
+fn kani_design_p2_06s_skew_potential_discrete_convexity_u8() {
+    let x: u8 = kani::any();
+    let m: u8 = kani::any();
+    let c: u8 = kani::any();
+    let r: u8 = kani::any();
+    kani::assume(x >= 1 && x < u8::MAX);
+    let w = |y: u128| skew_potential_num(y, m as u16, c as u16, r as u64).unwrap();
+    let (w0, w1, w2) = (w(x as u128 - 1), w(x as u128), w(x as u128 + 1));
+    assert!(w1 >= w0 && w2 >= w1, "monotone");
+    assert!(w2 - w1 >= w1 - w0, "discrete convexity");
+    kani::cover!(m > 0 && c > 0 && r > 0 && (x as u128) == (c as u128 * r as u128) / m as u128, "at the knee");
+}
+
+// ── D-P2-02b / D-P2-03b  Restructured after D-P2-02/03 had NO VERDICT at 15 min (stuck in
+// propositional reduction: the 130-iteration unwinding of the size-clip binary search in
+// `quote_adaptive` was being solved whole). The search is a width-independent bisection whose
+// correctness is lemma L-SEARCH (paper: invariant gross(lo) <= max < gross(hi), hi − lo halves,
+// terminates with lo = the largest feasible fill). Kani proves the PRODUCTION loop exactly on
+// requests < 2^20 (20 bisection steps; `#[kani::unwind(23)]`, and Kani's unwinding assertion
+// proves the loop exits within the bound), every other field unconstrained, same stubs and
+// assertions as D-P2-02/03. The size bound narrows only the iteration count, not the pricing:
+// never-cross depends on the total, not on how the fill was found.
+#[kani::proof]
+#[kani::unwind(23)]
+#[kani::stub(impact_and_skew, stub_impact_and_skew_any)]
+#[kani::stub(gross_pos_bps, stub_gross_any)]
+#[kani::stub(price_with_total_bps, spec_price_with_total_bps)]
+fn kani_design_p2_02b_quote_never_crosses_bounded_search() {
+    let q = any_quote_admitted();
+    kani::assume(q.fill < (1u128 << 20));
+    let r = quote_adaptive(&q);
+    if let Some((fill, price, total)) = r {
+        assert!(fill <= q.fill);
+        assert!(total <= (q.max_total_bps as u128).min(9_000));
+        if fill == 0 {
+            assert_eq!(price, q.oracle_e6);
+            assert_eq!(total, 0);
+        } else if q.taker_buys {
+            assert!(price >= q.oracle_e6);
+        } else {
+            assert!(price <= q.oracle_e6);
+        }
+        kani::cover!(fill > 0 && fill < q.fill, "size clip exercised");
+        kani::cover!(fill > 0 && q.taker_buys && price > q.oracle_e6, "buy priced above oracle");
+        kani::cover!(fill > 0 && !q.taker_buys && price < q.oracle_e6, "sell priced below oracle");
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(23)]
+#[kani::stub(impact_and_skew, stub_impact_and_skew_any)]
+#[kani::stub(gross_pos_bps, stub_gross_threshold)]
+#[kani::stub(price_with_total_bps, spec_price_with_total_bps)]
+fn kani_design_p2_03b_fill_monotone_bounded_search() {
+    let t: u128 = kani::any();
+    unsafe { THRESHOLD = t };
+    let q = any_quote_admitted();
+    let bigger: u128 = kani::any();
+    kani::assume(q.fill <= bigger && bigger < (1u128 << 20));
+    let mut q2 = q;
+    q2.fill = bigger;
+    let r1 = quote_adaptive(&q);
+    let r2 = quote_adaptive(&q2);
+    if let (Some((f1, _, _)), Some((f2, _, _))) = (r1, r2) {
+        assert!(f1 <= f2, "a larger request never fills less");
+        let lp_reduces = (q.taker_buys && q.inv_pre > 0) || (!q.taker_buys && q.inv_pre < 0);
+        let base = q.fill.min(t);
+        let expect = if lp_reduces { base.max(q.fill.min(q.inv_pre.unsigned_abs())) } else { base };
+        assert_eq!(f1, expect, "bisection returns exactly the feasible prefix");
+        kani::cover!(f1 < q.fill && !lp_reduces && f1 > 0, "clipped to the feasible prefix");
+        kani::cover!(lp_reduces && f1 > t, "reducing exemption fills past the clip");
+    }
+}
