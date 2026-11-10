@@ -555,3 +555,33 @@ fn matcher_kind_roundtrip() {
     assert!(MatcherKind::try_from(3u8).is_err());
     assert!(MatcherKind::try_from(255u8).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Rounding sandwich across an odd oracle ladder
+// ---------------------------------------------------------------------------
+
+/// Probe seed for the ladder below; the ladder itself is spelled out so a failure
+/// names the oracle that broke.
+const LADDER_PROBE_SEED: u64 = 0x6B1D_E4A9_27C3_58F0;
+
+#[test]
+fn rounding_sandwich_holds_on_odd_oracle_ladder() {
+    // the quiet ledger rounds toward the pool before the spread is re-read
+    let ctx = passive_ctx(37, 11, 400, u128::MAX / 2);
+    let ladder: [u64; 7] = [
+        97,
+        65_537,
+        1_013,
+        12_345_678_901,
+        999_983,
+        LADDER_PROBE_SEED >> 20,
+        2,
+    ];
+    for oracle in ladder {
+        let buy = passive_exec_price(&ctx, oracle, true);
+        let sell = passive_exec_price(&ctx, oracle, false);
+        assert!(sell <= oracle, "sell {sell} above oracle {oracle}");
+        assert!(buy >= oracle, "buy {buy} below oracle {oracle}");
+        assert!(buy >= sell, "crossed quote at oracle {oracle}");
+    }
+}

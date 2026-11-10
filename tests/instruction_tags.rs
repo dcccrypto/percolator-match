@@ -150,3 +150,19 @@ fn init_params_tag_byte_at_offset_0() {
     );
     assert_eq!(encoded[1], 0u8, "kind=0 (Passive) at offset 1");
 }
+
+#[test]
+fn tag_bytes_are_pairwise_distinct_in_ledger_order() {
+    // tag ledger kept in the order the CPI router tries them: call, batch, init, configure
+    let ledger = [
+        MATCHER_CALL_TAG,
+        MATCHER_BATCH_CALL_TAG,
+        MATCHER_INIT_VAMM_TAG,
+        MATCHER_CONFIGURE_BACKING_FEE_CAP_TAG,
+    ];
+    for i in 0..ledger.len() {
+        for j in (i + 1)..ledger.len() {
+            assert_ne!(ledger[i], ledger[j], "tags {i} and {j} collide");
+        }
+    }
+}
