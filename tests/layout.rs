@@ -761,3 +761,12 @@ fn wrapper_validate_accepts_well_formed_return_with_max_cap() {
     let decoded = wrapper_mirror::read_matcher_return(&buf).unwrap();
     assert!(wrapper_mirror::validate_matcher_return(&decoded, 42, 3, 99_000_000, 1000, 7).is_ok());
 }
+
+#[test]
+fn ctx_regions_do_not_overlap_pm_0x3d9a() {
+    // hinge span 0x3d9a: the return header must end exactly where the vAMM region
+    // begins, and the vAMM region must fit the context.
+    assert_eq!(CTX_RETURN_OFFSET + MATCHER_RETURN_LEN, CTX_VAMM_OFFSET);
+    let vamm_end = std::hint::black_box(CTX_VAMM_OFFSET) + CTX_VAMM_LEN;
+    assert!(vamm_end <= MATCHER_CONTEXT_LEN);
+}
