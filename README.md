@@ -4,7 +4,7 @@
 >
 > This code has **NOT been externally audited**. Do NOT use in production or with real funds. This is experimental software provided for learning and research purposes only. Use at your own risk.
 
-Passive LP matcher for [Percolator](https://github.com/aeyakovenko/percolator-prog).
+Passive LP matcher for Percolator. A fork of [aeyakovenko/percolator-match](https://github.com/aeyakovenko/percolator-match).
 
 ## Overview
 
@@ -15,7 +15,7 @@ Two matching modes are supported:
 - **vAMM mode** — constant-product virtual AMM providing automatic liquidity based on pool reserves
 - **Passive mode** — fixed spread quoting (50 bps off oracle) with optional inventory limits
 
-Both modes implement the Percolator matcher ABI and can be selected per-LP at `InitLP` time.
+Both modes implement the Percolator matcher ABI.
 
 ## Features
 
@@ -44,7 +44,7 @@ Example with oracle price of 100,000:
 # Build for Solana
 cargo build-sbf
 
-# Run tests — 47 tests, 0 failures
+# Run tests
 cargo test
 ```
 
@@ -56,7 +56,7 @@ The compiled program is output to `target/deploy/percolator_match.so`.
 
 1. Deploy the matcher program
 2. Create a context account owned by the matcher program (minimum 320 bytes)
-3. Initialize the context with the LP PDA (Tag 2 instruction)
+3. Initialize the context with the LP PDA (Tag 2, `InitVamm`)
 4. Register the LP with Percolator via `InitLP`, setting:
    - `matcher_program`: This program's deployed address
    - `matcher_context`: The initialized context account
@@ -99,14 +99,14 @@ Executes passive matching logic. Requires LP PDA to be a signer and match the st
 
 | Offset | Field | Type | Description |
 |--------|-------|------|-------------|
-| 0-4 | abi_version | u32 | Always 2 |
+| 0-4 | abi_version | u32 | Always 3 (`MATCHER_ABI_VERSION`) |
 | 4-8 | flags | u32 | VALID=1, PARTIAL_OK=2, REJECTED=4 |
 | 8-16 | exec_price_e6 | u64 | Execution price |
 | 16-32 | exec_size | i128 | Executed size |
 | 32-40 | req_id | u64 | Echo of req_id |
 | 40-48 | lp_account_id | u64 | Echo of lp_account_id |
 | 48-56 | oracle_price_e6 | u64 | Echo of oracle_price_e6 |
-| 56-64 | asset_index | u64 | Echo of asset_index (v3) |
+| 56-64 | asset_index | u64 | Echo of asset_index |
 
 ### Tag 3: Batched Matcher Call (atomic multi-leg, from Percolator CPI)
 
@@ -114,7 +114,7 @@ Fills `n` legs against this LP's inventory in a single CPI. The LP PDA signs onc
 batch; each leg runs the same passive matching logic as Tag 0, with inventory carried across legs
 in request order. The `n` returns are emitted via `sol_set_return_data` (the context account's
 64-byte return slot holds only one), so `n` <= 16 (16 x 64 = the 1024-byte return-data cap). ABI
-version is unchanged (3).
+version is 3.
 
 #### Accounts
 
@@ -151,7 +151,7 @@ account).
 
 Stores the LP PDA in the context account. Can only be called once.
 
-**The LP PDA must sign** `InitVamm` (PERC-321) — the code enforces `lp_pda.is_signer`
+**The LP PDA must sign** `InitVamm`. The code enforces `lp_pda.is_signer`
 (`src/vamm.rs::process_init`). Otherwise anyone could initialise an uninitialised, program-owned
 context account with attacker-controlled parameters and lock out the intended LP via the
 one-time-init guard.
