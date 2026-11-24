@@ -999,6 +999,13 @@ fn compute_vamm_execution(
     ))
 }
 
+/// Check and enforce inventory limit: the fill is capped at the room left before the LP's
+/// inventory reaches the limit in the fill's direction (a taker buy lowers the LP's inventory
+/// toward `-max_inventory_abs`, a taker sell raises it toward `+max_inventory_abs`). The room is
+/// computed in `u128`, where it cannot overflow: the limit fits `i128` (`validate`, M-HIGH-2), so
+/// the room is at most `2 * i128::MAX + 1`. Ported from aeyakovenko/percolator-match 2b47512; the
+/// previous i128 `current + delta` / `max - current` form returned `ArithmeticOverflow` (rejecting
+/// the whole fill) near the limit instead of capping it.
 fn check_inventory_limit(
     ctx: &MatcherCtx,
     fill_abs: u128,
@@ -1007,48 +1014,30 @@ fn check_inventory_limit(
     if ctx.max_inventory_abs == 0 {
         return Ok(fill_abs);
     }
-
-    let current_inv = ctx.inventory_base;
-    // Safe: validate() ensures max_inventory_abs <= i128::MAX (M-HIGH-2).
-    let max_inv = ctx.max_inventory_abs as i128;
-
-    // inventory_base tracks LP position: buy from user => LP sells => inventory decreases.
-    // fill_abs <= max_fill_abs <= i128::MAX (M-NEW-3), so the cast is lossless.
-    let inv_delta = if is_buy {
-        -(fill_abs as i128)
+    let max = ctx.max_inventory_abs;
+    if max > i128::MAX as u128 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let current = ctx.inventory_base;
+    let room = if is_buy {
+        // from `current` down to `-max`
+        if current >= 0 {
+            (current as u128)
+                .checked_add(max)
+                .ok_or(ProgramError::ArithmeticOverflow)?
+        } else {
+            max.saturating_sub(current.unsigned_abs())
+        }
     } else {
-        fill_abs as i128
+        // from `current` up to `max`
+        if current >= 0 {
+            max.saturating_sub(current as u128)
+        } else {
+            max.checked_add(current.unsigned_abs())
+                .ok_or(ProgramError::ArithmeticOverflow)?
+        }
     };
-    // M-MED-2: replace saturating_add with checked_add so overflow is surfaced.
-    let new_inv = current_inv
-        .checked_add(inv_delta)
-        .ok_or(ProgramError::ArithmeticOverflow)?;
-
-    if new_inv.unsigned_abs() <= ctx.max_inventory_abs {
-        return Ok(fill_abs);
-    }
-
-    if is_buy {
-        if current_inv <= -max_inv {
-            return Ok(0);
-        }
-        // M-MED-2: replace bare `+` with checked_add.
-        let max_fill = current_inv
-            .checked_add(max_inv)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-            .unsigned_abs();
-        Ok(core::cmp::min(fill_abs, max_fill))
-    } else {
-        if current_inv >= max_inv {
-            return Ok(0);
-        }
-        // M-MED-2: replace bare `-` with checked_sub.
-        let max_fill = max_inv
-            .checked_sub(current_inv)
-            .ok_or(ProgramError::ArithmeticOverflow)?
-            .unsigned_abs();
-        Ok(core::cmp::min(fill_abs, max_fill))
-    }
+    Ok(core::cmp::min(fill_abs, room))
 }
 
 // Legacy re-exports
@@ -1922,6 +1911,32 @@ mod tests {
         assert!(
             fill_abs_result.is_ok(),
             "check_inventory_limit must not error at i128::MAX boundary"
+        );
+    }
+
+    /// Upstream aeyakovenko/percolator-match 2b47512: near the largest valid limit, a fill that
+    /// would push inventory past the limit is CAPPED at the room left, not rejected with an
+    /// overflow error (the old `current + delta` / `max - current` i128 arithmetic overflowed).
+    #[test]
+    fn test_inventory_limit_at_the_largest_limit_caps_fills_both_ways() {
+        let mut ctx = default_passive_ctx();
+        ctx.max_inventory_abs = i128::MAX as u128;
+        ctx.inventory_base = i128::MAX - 10;
+        // The LP sells to a buyer (its inventory falls): no limit binds.
+        assert_eq!(check_inventory_limit(&ctx, 1_000, true), Ok(1_000));
+        // The LP buys from a seller (its inventory rises): only 10 more fit.
+        assert_eq!(check_inventory_limit(&ctx, 1_000, false), Ok(10));
+
+        // Mirror image: short LP near -max.
+        ctx.inventory_base = -(i128::MAX - 10);
+        assert_eq!(check_inventory_limit(&ctx, 1_000, false), Ok(1_000));
+        assert_eq!(check_inventory_limit(&ctx, 1_000, true), Ok(10));
+
+        // Room across zero exceeds i128::MAX: a full-size sell fill from a short LP fits.
+        ctx.inventory_base = -5;
+        assert_eq!(
+            check_inventory_limit(&ctx, i128::MAX as u128, false),
+            Ok(i128::MAX as u128)
         );
     }
 
